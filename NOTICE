@@ -1,0 +1,46 @@
+PikaPDF — Additional terms under GNU GPLv3 section 7
+====================================================
+
+PikaPDF is licensed under the GNU General Public License, version 3 (see LICENSE).
+In accordance with GPLv3 section 7, the copyright holder adds the following terms.
+They apply to every copy and to every work based on PikaPDF ("derivative works").
+
+1. Attribution must be preserved (GPLv3 §7(b)).
+   Derivative works, and copies that are redistributed, must keep the following
+   notice visible in their "About" dialog (or equivalent program information screen)
+   and in their documentation or README:
+
+       Based on PikaPDF — https://github.com/taeheekim2024-star/pikapdf
+
+   The notice may be translated, but it may not be removed, hidden, or made
+   materially less prominent than other credits shown in the same place.
+
+2. Names and marks are not licensed (GPLv3 §7(e)).
+   The GPLv3 grant does not include any trademark rights. The names "PikaPDF" and
+   "PDF 뷰어" as used for this project, the "Pika" brand, the application icon and
+   logo, and the project site address are reserved. Derivative works must use a
+   different name and icon. See TRADEMARK.md for what is and is not allowed.
+
+3. Additional permission: linking with Microsoft WebView2 (GPLv3 §7).
+   As a special exception, the copyright holder grants permission to link or
+   combine this program with the Microsoft Edge WebView2 SDK and the WebView2
+   Runtime (including Microsoft.Web.WebView2.Core.dll,
+   Microsoft.Web.WebView2.WinForms.dll and WebView2Loader.dll, under Microsoft's
+   license terms), and to copy and distribute the resulting work, provided that
+   the terms of the GPLv3 are followed in all other respects. If you modify this
+   program, you may extend this exception to your version, but you are not
+   obliged to do so.
+
+4. Bundled and external components.
+   PDF.js (Mozilla, Apache License 2.0) is bundled; its license and the licenses
+   of its wasm decoders are kept in THIRD-PARTY-LICENSES.txt. Ghostscript (via
+   PDF24), Microsoft Office and Hancom Office are NOT part of this program: they
+   are separate, independently installed programs that PikaPDF merely invokes.
+
+5. Dual licensing.
+   A separate commercial license may be arranged for uses that are incompatible
+   with the GPLv3 (for example, bundling inside closed-source software).
+   See COMMERCIAL-LICENSE.md.
+
+These additional terms do not restrict any right granted by the GPLv3 beyond what
+section 7 permits, and they may be removed by the copyright holder at any time.

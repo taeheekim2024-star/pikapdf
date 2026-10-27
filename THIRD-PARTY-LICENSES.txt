@@ -1,0 +1,40 @@
+PikaPDF — Third-Party Licenses
+==============================
+
+PikaPDF is distributed under the GNU General Public License v3.0 (see LICENSE) with the
+additional terms in NOTICE. It builds on, or talks to, the following components.
+
+Bundled (shipped inside the release zip)
+----------------------------------------
+
+PDF.js ................................. Apache License 2.0
+    https://github.com/mozilla/pdf.js   © Mozilla Foundation and contributors
+    The prebuilt distribution (pdfjs/) is included unmodified except for a small patch
+    (src/patch_pdfjs.py) that lets the incremental-save path record page rotations.
+    The Apache-2.0 license text ships in pdfjs/LICENSE. PDF.js bundles these decoders
+    as WebAssembly (license texts in pdfjs/web/wasm/):
+      OpenJPEG ............... BSD 2-Clause
+      JBIG2 (pdf.js) ......... Apache License 2.0
+      qcms ................... MIT
+
+Microsoft Edge WebView2 SDK ............ Microsoft Software License Terms (redistributable)
+    Microsoft.Web.WebView2.Core.dll, Microsoft.Web.WebView2.WinForms.dll, WebView2Loader.dll
+    https://www.nuget.org/packages/Microsoft.Web.WebView2  (version 1.0.4191.47)
+    Distributed with this program under Microsoft's redistribution terms; see NOTICE §3
+    for the GPLv3 linking exception that covers this combination.
+
+Not bundled (installed separately by the user; invoked as external programs)
+----------------------------------------------------------------------------
+
+Microsoft Edge WebView2 Runtime ........ part of Windows / Microsoft Edge (system component)
+Ghostscript (via PDF24 Creator) ........ GNU AGPL v3  — used only for "용량 줄이기 / 잠금 해제",
+    run as a separate process from C:\Program Files\PDF24\gs. Not distributed with PikaPDF.
+Microsoft Office (Word/Excel/PowerPoint) and Hancom Office (한글) — driven through COM
+    automation for document conversion only; not distributed with PikaPDF.
+
+Fonts and icons
+---------------
+The application icon and logo were drawn for this project (see TRADEMARK.md).
+UI text uses the system font (Malgun Gothic / Segoe UI).
+
+This file is provided to satisfy the attribution requirements of the above licenses.

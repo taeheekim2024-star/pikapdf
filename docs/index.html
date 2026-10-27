@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PikaPDF — Windows용 가볍고 빠른 PDF 뷰어·주석 도구</title>
+<meta name="description" content="탭, 형광펜·메모·서명, 페이지 정리, 용량 줄이기, PDF→Word, 오피스·한글→PDF. 설치 없이 폴더 하나로. 무료·오픈소스(GPLv3).">
+<link rel="icon" href="logo.png">
+<style>
+  :root { --brand: #1b4e91; --brand-dark: #17427c; }
+  body { margin: 0; font-family: 'Malgun Gothic', 'Segoe UI', -apple-system, sans-serif; background: #f3f4f6; color: #1f2328; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 48px 24px 56px; }
+  .hero { display: flex; align-items: center; gap: 22px; margin-bottom: 20px; }
+  .hero img { width: 84px; height: 84px; }
+  h1 { margin: 0; font-size: 30px; }
+  .sub { margin: 6px 0 0; color: #5a6270; font-size: 15px; }
+  .actions { display: flex; gap: 12px; flex-wrap: wrap; margin: 26px 0; }
+  .btn { display: inline-block; padding: 12px 22px; border-radius: 8px; background: var(--brand); color: #fff; text-decoration: none; font-size: 15px; }
+  .btn:hover { background: var(--brand-dark); }
+  .btn.secondary { background: #fff; color: #1f2328; border: 1px solid #d0d5dc; }
+  .notice { display: none; gap: 12px; align-items: flex-start; margin: 0 0 22px; padding: 11px 14px; border: 1px solid #c9d8f5; border-left: 4px solid var(--brand); border-radius: 8px; background: #eef3fd; font-size: 14px; }
+  .notice p { margin: 0; flex: 1; } .notice a { color: var(--brand-dark); font-weight: 600; margin-left: 6px; } .notice button { border: none; background: none; cursor: pointer; color: #6b7482; font-size: 15px; }
+  .shot { width: 100%; border: 1px solid #e3e6ea; border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,.08); }
+  h2 { font-size: 18px; margin: 34px 0 10px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  td { padding: 8px 10px; border-top: 1px solid #e3e6ea; vertical-align: top; }
+  td:first-child { width: 90px; font-weight: 600; color: #5a6270; }
+  .foot { margin-top: 36px; font-size: 13px; color: #8a919c; line-height: 1.7; }
+  .foot a { color: #5a6270; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <img src="logo.png" alt="">
+    <div>
+      <h1>PikaPDF</h1>
+      <p class="sub">Windows용 가볍고 빠른 PDF 뷰어·주석 도구. 설치 없이 폴더 하나로. 무료·오픈소스(GPLv3).</p>
+    </div>
+  </div>
+
+  <div class="notice" id="notice"></div>
+
+  <div class="actions">
+    <a class="btn" href="https://github.com/taeheekim2024-star/pikapdf/releases">내려받기 (Windows 64비트)</a>
+    <a class="btn secondary" href="https://github.com/taeheekim2024-star/pikapdf">GitHub 저장소</a>
+  </div>
+
+  <img class="shot" src="screenshot.png" alt="PikaPDF 화면">
+
+  <h2>되는 것</h2>
+  <table>
+    <tr><td>보기</td><td>탭 여러 개, 검색, 목차·썸네일, 두 쪽 보기, 프레젠테이션. 한글 PDF도 깨끗하게.</td></tr>
+    <tr><td>주석</td><td>형광펜(여러 색), 자유 그리기, 텍스트 메모, 이미지 넣기, 서명, 댓글, 양식 입력.</td></tr>
+    <tr><td>저장</td><td>Ctrl+S로 원본에 바로 저장(직전 원본 자동 백업), 다른 이름으로 저장, 인쇄.</td></tr>
+    <tr><td>페이지</td><td>삭제·잘라내기·복사·추출·순서 바꾸기, 다른 PDF나 이미지 합치기, 회전 저장(주석 유지).</td></tr>
+    <tr><td>도구</td><td>용량 줄이기·잠금 해제(PDF24의 Ghostscript), 이미지 추출, PDF→이미지/텍스트/Word, 오피스·한글 문서→PDF.</td></tr>
+    <tr><td>빠름</td><td>더블클릭에서 첫 화면까지 약 1초. 이미 떠 있는 창에 새 탭은 0.1초대.</td></tr>
+  </table>
+
+  <h2>어떻게 만들었나</h2>
+  <p style="font-size:14px;line-height:1.7">Firefox의 PDF 엔진 <a href="https://mozilla.github.io/pdf.js/">PDF.js</a>를 Windows 내장 WebView2 창에 올리고, C# 호스트가 파일 저장·탭·도구를 맡습니다.
+  Visual Studio 없이 Windows에 기본 포함된 C# 컴파일러만으로 빌드됩니다. 같은 제작자의 XPS 피팅 프로그램 <a href="https://taeheekim2024-star.github.io/pikaxps/">PikaXPS</a>와 한 식구입니다.</p>
+
+  <div class="foot">
+    © 2026 Pika · 코드는 <a href="https://github.com/taeheekim2024-star/pikapdf/blob/main/LICENSE">GPLv3</a> + <a href="https://github.com/taeheekim2024-star/pikapdf/blob/main/NOTICE">추가 조건</a>(출처 표기 유지, WebView2 연결 예외) ·
+    이름과 아이콘은 <a href="https://github.com/taeheekim2024-star/pikapdf/blob/main/TRADEMARK.md">상표 정책</a> · 계정·추적·광고 없음.<br>
+    프로그램은 시작할 때 이 사이트의 <code>notice.json</code> 하나를 읽어 공지를 보여 줄 수 있습니다(도움말 메뉴에서 끌 수 있음).
+  </div>
+</div>
+<script>
+(function () {
+  fetch("notice.json", { cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; }).then(function (n) {
+    if (!n || typeof n !== "object") return;
+    var text = n.text_ko || n.text; if (!text) return;
+    if (n.until && new Date(n.until + "T23:59:59") < new Date()) return;
+    var id = String(n.id || text);
+    try { if (localStorage.getItem("notice-dismissed") === id) return; } catch (e) {}
+    var box = document.getElementById("notice"), p = document.createElement("p");
+    p.textContent = (n.kind === "sponsor" ? "♥ " : n.kind === "update" ? "새 소식: " : "") + String(text).slice(0, 300);
+    if (n.url && /^https:\/\//.test(n.url)) { var a = document.createElement("a"); a.href = n.url; a.textContent = n.label_ko || n.label || "열기"; p.appendChild(a); }
+    var x = document.createElement("button"); x.type = "button"; x.textContent = "✕"; x.title = "닫기";
+    x.onclick = function () { try { localStorage.setItem("notice-dismissed", id); } catch (e) {} box.style.display = "none"; };
+    box.appendChild(p); box.appendChild(x); box.style.display = "flex";
+  }).catch(function () {});
+})();
+</script>
+</body>
+</html>

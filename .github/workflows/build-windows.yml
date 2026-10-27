@@ -1,0 +1,42 @@
+name: build-windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch pdf.js and WebView2 SDK, apply patch
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\setup.ps1
+      - name: Build
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\src\build.ps1
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "PikaPDF-Windows-x64"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item PdfViewer.exe, PdfViewer.exe.config, inject.js, app.ico, README.txt, 등록.ps1, 등록해제.ps1, LICENSE, NOTICE, TRADEMARK.md, COMMERCIAL-LICENSE.md, THIRD-PARTY-LICENSES.txt $out
+          Copy-Item *.dll $out
+          Copy-Item start, pdfjs, src $out -Recurse
+          Compress-Archive -Path $out -DestinationPath "$out.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PikaPDF-Windows-x64
+          path: PikaPDF-Windows-x64.zip
+      - name: Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PikaPDF-Windows-x64.zip
