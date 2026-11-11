@@ -10,6 +10,18 @@ Remove-Item 'HKCU:\Software\PDF뷰어' -Recurse -Force -ErrorAction SilentlyCont
 Remove-ItemProperty 'HKCU:\Software\RegisteredApplications' -Name $appName -ErrorAction SilentlyContinue
 Remove-ItemProperty 'HKCU:\Software\Classes\.pdf\OpenWithProgids' -Name $progId -ErrorAction SilentlyContinue
 
+# 그림 파일 우클릭 메뉴 ("PDF로 변환", "PDF 하나로 합치기"). 우리가 만든 키만 지우고, 비게 된 윗 키는 정리한다.
+$imageExts = '.jpg', '.jpeg', '.jpe', '.jfif', '.png', '.bmp', '.dib', '.gif', '.tif', '.tiff', '.webp', '.heic', '.heif', '.avif'
+foreach ($ext in $imageExts) {
+    $extKey = "HKCU:\Software\Classes\SystemFileAssociations\$ext"
+    foreach ($verb in 'PdfViewer.ToPdf', 'PdfViewer.ToPdfMerge') {
+        Remove-Item "$extKey\shell\$verb" -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($k in "$extKey\shell", $extKey) {
+        if ((Test-Path $k) -and -not (Get-ChildItem $k) -and ((Get-Item $k).ValueCount -eq 0)) { Remove-Item $k -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 foreach ($dir in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('DesktopDirectory'))) {
     Remove-Item (Join-Path $dir "$appName.lnk") -Force -ErrorAction SilentlyContinue
 }

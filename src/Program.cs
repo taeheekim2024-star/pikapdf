@@ -1,7 +1,8 @@
 ﻿// PDF 뷰어 - Firefox의 PDF 엔진(PDF.js)을 Windows WebView2 창에 올린 단독 실행 프로그램.
 // 창 하나에 탭 여러 개(크롬식 헤더), 프로그램은 한 번만 실행(두 번째 실행은 열린 창에 탭으로 전달).
 // 도구: 페이지 회전 저장(PDF.js 패치), 용량 줄이기·잠금 해제(PDF24의 Ghostscript),
-//       이미지 추출·PDF→이미지/텍스트(PDF.js), PDF→Word·오피스/한글→PDF(Office·한컴 COM)
+//       이미지 추출·PDF→이미지/텍스트(PDF.js), PDF→Word·오피스/한글→PDF(Office·한컴 COM),
+//       그림→PDF(ImagePdf.cs; 탐색기 우클릭 메뉴와 명령줄은 ShellConvert.cs)
 // 빌드: src\build.ps1 (Windows에 기본 포함된 .NET Framework C# 컴파일러 사용, C# 5 문법만 사용)
 using System;
 using System.Collections.Generic;
@@ -40,13 +41,26 @@ namespace PdfViewerApp
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            // 실행 중에 새 버전을 설치하면 옛 실행 파일이 PdfViewer.old.exe 로 남는다 → 다음 시작 때 치운다
+            // 실행 중에 새 버전을 설치하면 옛 실행 파일이 PdfViewer.old*.exe 로 남는다 → 다음 시작 때 치운다 (아직 쓰는 중이면 그대로 둠)
             try
             {
-                string old = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PdfViewer.old.exe");
-                if (File.Exists(old)) File.Delete(old);
+                foreach (string old in Directory.GetFiles(AppDomain.CurrentDomain.BaseDirectory, "PdfViewer.old*.exe"))
+                {
+                    try { File.Delete(old); } catch { }
+                }
             }
             catch { }
+
+            // 탐색기 우클릭 "PDF로 변환" / 명령줄 변환: 뷰어 창 없이 변환만 하고 끝낸다
+            if (ShellConvert.IsCommand(args))
+            {
+                try { return ShellConvert.Run(args); }
+                catch (Exception ex)
+                {
+                    Log("img2pdf FATAL " + ex);
+                    return 2;
+                }
+            }
 
             var files = new List<string>();
             string selftestDir = null;
@@ -79,6 +93,7 @@ namespace PdfViewerApp
                 }
             }
 
+            Util.NoRecent = selftestDir != null;
             try
             {
                 Application.Run(new MainForm(files, selftestDir, primary));
@@ -134,7 +149,7 @@ namespace PdfViewerApp
     class MainForm : Form
     {
         public const string AppName = "PDF 뷰어";
-        public const string AppVersion = "1.2";
+        public const string AppVersion = "1.3";
         public static readonly string BaseDir = AppDomain.CurrentDomain.BaseDirectory;
         public static readonly string DataDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PDF뷰어");
@@ -321,6 +336,7 @@ namespace PdfViewerApp
             m.Items.Add(MenuItemOf("PDF → 텍스트...", null, delegate { ToolExtractText(); }));
             m.Items.Add(MenuItemOf("PDF → Word(docx)...", null, delegate { ToolPdfToWord(); }));
             m.Items.Add(new ToolStripSeparator());
+            m.Items.Add(MenuItemOf("그림 → PDF...", null, delegate { ToolImagesToPdf(null); }));
             m.Items.Add(MenuItemOf("오피스·한글 문서 → PDF...", null, delegate { ToolOfficeToPdf(); }));
             return m;
         }
@@ -356,8 +372,9 @@ namespace PdfViewerApp
             Info(AppName + " " + AppVersion + "\n\n" +
                  "PDF 엔진: PDF.js 6.4.299 (Mozilla, Apache-2.0)\n" +
                  "화면: Microsoft WebView2 " + wv + "\n" +
-                 "용량 줄이기·잠금 해제: PDF24에 포함된 Ghostscript" + (Tools.FindGs() != null ? "" : " (지금은 없음)") + "\n" +
-                 "변환: Microsoft Office, 한컴오피스 (설치된 경우)\n\n" +
+                 "용량 줄이기·잠금 해제: Ghostscript (PDF24 Creator에 포함된 것 또는 따로 설치한 것)" + (Tools.FindGs() != null ? "" : " — 지금은 없음") + "\n" +
+                 "문서 변환: Microsoft Office, 한컴오피스 (설치된 경우)\n" +
+                 "그림 → PDF: 자체 기능 (JPG는 화질 그대로, HEIC·WebP는 Windows 코덱 사용)\n\n" +
                  "라이선스: GPLv3 (WebView2 연결 예외 포함). 이름·아이콘은 제작자의 표장이며 파생작은 출처 표기를 유지해야 합니다 (NOTICE, TRADEMARK.md).\n" +
                  "공식 배포: " + Notice.ProjectUrl + "\n" +
                  "시작할 때 프로젝트 사이트의 notice.json 하나를 읽어 공지를 보여 줄 수 있습니다 (도움말 메뉴에서 끄기).\n\n" +
@@ -434,7 +451,7 @@ namespace PdfViewerApp
                 {
                     Directory.CreateDirectory(SelftestDir);
                     var watchdog = new System.Windows.Forms.Timer();
-                    watchdog.Interval = 240000;
+                    watchdog.Interval = 480000;
                     watchdog.Tick += delegate { SelftestFail("timeout"); };
                     watchdog.Start();
                 }
@@ -455,8 +472,12 @@ namespace PdfViewerApp
                 }
                 // 자체 시험: 첫 파일로 1차 시험, 둘째 파일은 두 번째 인스턴스를 거쳐 탭으로 들어오는지 본다
                 if (SelftestDir != null && files.Count > 1) files = files.Take(1).ToList();
-                if (files.Count == 0) await NewTab(null);
-                else OpenPaths(files);
+                // 그림 파일로 시작했으면(연결 프로그램 등) 빈 탭을 띄우고 PDF로 바꾸는 창을 연다
+                var startImages = files.Where(ImagePdf.IsImageFile).ToList();
+                var startDocs = files.Where(f => !ImagePdf.IsImageFile(f)).ToList();
+                if (startDocs.Count == 0) await NewTab(null);
+                else OpenPaths(startDocs);
+                if (startImages.Count > 0) ToolImagesToPdf(startImages);
             }
             catch (Exception ex)
             {
@@ -544,6 +565,13 @@ namespace PdfViewerApp
 
         public async void OpenPaths(List<string> paths)
         {
+            // 그림 파일(끌어다 놓기, 두 번째 실행 등)은 열지 않고 PDF로 바꾸는 흐름으로 보낸다
+            var images = paths.Where(p => !string.IsNullOrEmpty(p) && ImagePdf.IsImageFile(p) && File.Exists(p)).ToList();
+            if (images.Count > 0)
+            {
+                paths = paths.Where(p => !images.Contains(p)).ToList();
+                BeginInvoke((Action)delegate { ToolImagesToPdf(images); });
+            }
             foreach (var p in paths)
             {
                 if (string.IsNullOrEmpty(p)) continue;
@@ -759,6 +787,23 @@ namespace PdfViewerApp
             return await task;
         }
 
+        // 진행 창의 글을 작업 쪽에서 바꿀 수 있는 변형 ("3 / 20 그림.jpg" 같은 진행 표시용)
+        async Task<T> RunWithProgressText<T>(string title, string message, bool cancellable, Func<CancellationToken, Action<string>, Task<T>> work)
+        {
+            if (SelftestDir != null) return await work(CancellationToken.None, delegate(string s) { });
+            var pf = new ProgressForm(title, message, cancellable);
+            Task<T> task = null;
+            pf.Shown += async delegate
+            {
+                try { task = work(pf.Cts.Token, pf.SetMessage); await task; }
+                catch { }
+                pf.Finish();
+            };
+            pf.ShowDialog(this);
+            if (task == null) throw new Exception("작업을 시작하지 못했습니다");
+            return await task;
+        }
+
         async Task RunWithProgressVoid(string title, string message, bool cancellable, Func<CancellationToken, Task> work)
         {
             await RunWithProgress<bool>(title, message, cancellable, async delegate(CancellationToken ct) { await work(ct); return true; });
@@ -828,7 +873,7 @@ namespace PdfViewerApp
             var doc = RequireDoc();
             if (doc == null) return;
             string gs = Tools.FindGs();
-            if (gs == null) { Error("용량 줄이기에는 PDF24 Creator에 포함된 Ghostscript가 필요합니다.\n(C:\\Program Files\\PDF24\\gs 가 없습니다)"); return; }
+            if (gs == null) { Error("용량 줄이기에는 Ghostscript가 필요합니다.\n\n" + Tools.GsHelp); return; }
             if (doc.Dirty) { Info("저장하지 않은 변경이 있습니다. 먼저 Ctrl+S 로 저장해 주세요."); return; }
             string preset;
             bool overwrite;
@@ -865,7 +910,7 @@ namespace PdfViewerApp
             var doc = RequireDoc();
             if (doc == null) return;
             string gs = Tools.FindGs();
-            if (gs == null) { Error("잠금 해제에는 PDF24 Creator에 포함된 Ghostscript가 필요합니다.\n(C:\\Program Files\\PDF24\\gs 가 없습니다)"); return; }
+            if (gs == null) { Error("잠금 해제에는 Ghostscript가 필요합니다.\n\n" + Tools.GsHelp); return; }
             string password;
             using (var dlg = new PasswordDialog())
             {
@@ -1001,6 +1046,91 @@ namespace PdfViewerApp
             if (results.Count > 0) OpenPaths(results);
         }
 
+        // 그림 파일(들)을 PDF로. files가 null이면 고르는 창을 띄운다 (끌어다 놓기·명령줄에서는 경로가 넘어온다).
+        public async void ToolImagesToPdf(List<string> files)
+        {
+            if (files == null)
+            {
+                using (var dlg = new OpenFileDialog())
+                {
+                    dlg.Title = "PDF로 만들 그림 선택";
+                    dlg.Filter = ImagePdf.DialogFilter;
+                    dlg.Multiselect = true;
+                    if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                    files = dlg.FileNames.ToList();
+                }
+            }
+            PageFit fit;
+            var jobs = new List<ImageJob>();
+            try
+            {
+                files = ImagePdf.SortNatural(files.Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase));
+                if (files.Count == 0) return;
+
+                bool merge;
+                using (var dlg = new ImagesToPdfDialog(files))
+                {
+                    if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                    fit = dlg.Fit;
+                    merge = dlg.Merge;
+                }
+                ImagePdf.FitSetting = fit;
+                if (files.Count > 1) ImagePdf.MergeSetting = merge;
+
+                if (merge || files.Count == 1)
+                {
+                    string suffix = files.Count > 1 ? " 외 " + (files.Count - 1) + "장" : "";
+                    string outPath = AskSavePath(files[0], suffix, ".pdf", "PDF 파일 (*.pdf)|*.pdf", "PDF로 저장");
+                    if (outPath == null) return;
+                    jobs.Add(new ImageJob(files, outPath));
+                }
+                else
+                {
+                    // 그림마다 하나씩: 그림 옆에 같은 이름으로 (이미 있으면 "이름 (2).pdf")
+                    var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var f in files) jobs.Add(new ImageJob(new[] { f }, ImagePdf.UniquePath(Path.ChangeExtension(f, ".pdf"), taken)));
+                }
+            }
+            catch (Exception ex) { Error("그림을 PDF로 바꿀 준비를 하지 못했습니다:\n" + ex.Message); return; }
+
+            ImageBatchResult res;
+            try
+            {
+                res = await RunWithProgressText("그림 → PDF", "그림을 읽는 중…", true,
+                    (ct, report) => ImagePdf.RunJobsAsync(jobs, fit, ct, report));
+            }
+            catch (OperationCanceledException) { return; }
+            catch (Exception ex) { Error("PDF로 만들지 못했습니다:\n" + ex.Message); return; }
+
+            if (res.Created.Count == 0)
+            {
+                Error("PDF로 만들지 못했습니다.\n\n" + FailList(res.Failed));
+                return;
+            }
+            if (res.Failed.Count > 0) Info("다음 그림은 읽지 못해 빠졌습니다.\n\n" + FailList(res.Failed));
+            if (res.Created.Count == 1) ShowCreatedPdf(res.Created[0]);
+            else Info(string.Format("PDF {0}개를 그림 옆에 만들었습니다.", res.Created.Count));
+        }
+
+        static string FailList(List<string> failed)
+        {
+            var lines = failed.Take(8).ToList();
+            if (failed.Count > lines.Count) lines.Add("… 외 " + (failed.Count - lines.Count) + "개");
+            return string.Join("\n", lines);
+        }
+
+        // 방금 만든(또는 덮어쓴) PDF를 보여 준다: 이미 열려 있던 파일이면 그 탭을 다시 불러온다
+        void ShowCreatedPdf(string path)
+        {
+            var open = docs.FirstOrDefault(d => d.DocPath != null && string.Equals(d.DocPath, path, StringComparison.OrdinalIgnoreCase));
+            if (open != null && open.Core != null)
+            {
+                SelectTab(open);
+                open.NavigateTo(path);
+            }
+            else OpenPaths(new List<string> { path });
+        }
+
         // ---------- 자체 시험 ----------
 
         public void SelftestLog(string line)
@@ -1070,8 +1200,13 @@ namespace PdfViewerApp
             catch (Exception ex) { SelftestLog("capture failed: " + ex.Message); }
         }
 
+        bool passiveFlowStarted;
+
         public async void OnPassiveTabReady(DocTab doc)
         {
+            // 2차 시험 흐름은 한 번만 (시험 중에 더 여는 탭들도 "준비됨"을 보내오므로)
+            if (passiveFlowStarted) return;
+            passiveFlowStarted = true;
             try
             {
                 await Task.Delay(1500);
@@ -1116,7 +1251,7 @@ namespace PdfViewerApp
             catch (Exception ex) { SelftestLog("TOOL rotate FAILED " + ex.Message); ok = false; }
 
             string gs = Tools.FindGs();
-            if (gs == null) { SelftestLog("TOOL gs not found - compress/unlock skipped"); ok = false; }
+            if (gs == null) SelftestLog("TOOL gs not found (PDF24/Ghostscript 없음) - compress/unlock skipped");
             else
             {
                 try
@@ -1191,7 +1326,383 @@ namespace PdfViewerApp
                 }
                 catch (Exception ex) { SelftestLog("TOOL word→pdf FAILED " + ex.Message); ok = false; }
             }
+
+            // 대화상자의 선택 단추 묶음: 쪽 범위를 바꿔도 방향·형식 선택이 풀리지 않아야 한다
+            try
+            {
+                using (var d = new RotateDialog(1, 5))
+                {
+                    d.TestChooseAllPages();
+                    SelftestLog("DIALOG rotate all-pages → delta=" + d.Delta + " pages=" + d.Pages.Count);
+                    if (d.Delta != 90 || d.Pages.Count != 5) ok = false;
+                }
+                using (var d = new PagesToImagesDialog(1, 5))
+                {
+                    d.TestChooseJpgThenAllPages();
+                    string j = d.ToJson();
+                    SelftestLog("DIALOG pages2img jpg+all → " + j);
+                    if (j.IndexOf("\"jpeg\"", StringComparison.Ordinal) < 0 || j.IndexOf("[1,2,3,4,5]", StringComparison.Ordinal) < 0) ok = false;
+                }
+                using (var d = new ImagesToPdfDialog(new List<string> { "a.png", "b.png" }))
+                {
+                    d.TestChoose(true, false);
+                    SelftestLog("DIALOG img2pdf a4+each → fit=" + d.Fit + " merge=" + d.Merge);
+                    if (d.Fit != PageFit.A4 || d.Merge) ok = false;
+                }
+                // 대화상자 모습을 그림으로 남긴다 (화면 배율에 따른 배치를 눈으로 확인하는 용도)
+                using (var d = new RotateDialog(2, 12)) SelftestCaptureDialog(d, "dlg_rotate.png");
+                using (var d = new PagesToImagesDialog(2, 12)) SelftestCaptureDialog(d, "dlg_pages2img.png");
+                using (var d = new CompressDialog()) SelftestCaptureDialog(d, "dlg_compress.png");
+                using (var d = new ImagesToPdfDialog(new List<string> { @"C:\그림\영수증 1.jpg", @"C:\그림\영수증 2.jpg", @"C:\그림\스캔 3.png", @"C:\그림\4.png" }))
+                    SelftestCaptureDialog(d, "dlg_img2pdf.png");
+                using (var d = new ImagesToPdfDialog(new List<string> { @"C:\그림\그래프.png" })) SelftestCaptureDialog(d, "dlg_img2pdf_single.png");
+                using (var d = new ProgressForm("PDF로 변환", "3 / 20   영수증 3.jpg", true)) SelftestCaptureDialog(d, "dlg_progress.png");
+            }
+            catch (Exception ex) { SelftestLog("DIALOG check FAILED " + ex.Message); ok = false; }
+
+            if (!await SelftestImagesToPdf(doc)) ok = false;
+
             SelftestLog("TOOLS " + (ok ? "OK" : "FAIL"));
+            return ok;
+        }
+
+        // 대화상자를 화면 밖에서 투명하게 잠깐 띄워(포커스를 뺏지 않음) 그림으로 남긴다
+        void SelftestCaptureDialog(Form dlg, string name)
+        {
+            try
+            {
+                var db = dlg as DialogBase;
+                if (db != null) db.NoActivate = true;
+                var pf = dlg as ProgressForm;
+                if (pf != null) pf.NoActivate = true;
+                dlg.StartPosition = FormStartPosition.Manual;
+                dlg.Location = new Point(-6000, -6000);
+                dlg.Opacity = 0;
+                dlg.ShowInTaskbar = false;
+                dlg.Show();
+                using (var bmp = new Bitmap(dlg.Width, dlg.Height))
+                {
+                    dlg.DrawToBitmap(bmp, new Rectangle(0, 0, bmp.Width, bmp.Height));
+                    bmp.Save(Path.Combine(SelftestDir, name), System.Drawing.Imaging.ImageFormat.Png);
+                }
+                dlg.Hide();
+                SelftestLog("CAPTURED " + name + " size=" + dlg.Width + "x" + dlg.Height);
+            }
+            catch (Exception ex) { SelftestLog("dialog capture failed: " + name + " " + ex.Message); }
+        }
+
+        // ---------- 자체 시험: 그림 → PDF ----------
+
+        static readonly Color[] TestQuad = { Color.FromArgb(255, 0, 0), Color.FromArgb(0, 255, 0), Color.FromArgb(0, 0, 255), Color.FromArgb(255, 255, 0) };
+
+        // 네 칸(왼쪽 위·오른쪽 위·왼쪽 아래·오른쪽 아래)을 주어진 색으로 칠한 300×200 그림
+        static Bitmap TestQuadBitmap(Color tl, Color tr, Color bl, Color br, System.Drawing.Imaging.PixelFormat format)
+        {
+            var bmp = new Bitmap(300, 200, format);
+            bmp.SetResolution(96, 96);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.CompositingMode = CompositingMode.SourceCopy;
+                using (var b = new SolidBrush(tl)) g.FillRectangle(b, 0, 0, 150, 100);
+                using (var b = new SolidBrush(tr)) g.FillRectangle(b, 150, 0, 150, 100);
+                using (var b = new SolidBrush(bl)) g.FillRectangle(b, 0, 100, 150, 100);
+                using (var b = new SolidBrush(br)) g.FillRectangle(b, 150, 100, 150, 100);
+            }
+            return bmp;
+        }
+
+        // 색 인덱스 그림(8비트 팔레트, 1비트 흑백): 네 칸에 팔레트 번호를 써넣는다
+        static Bitmap TestIndexedBitmap(System.Drawing.Imaging.PixelFormat format, Color[] palette, int tl, int tr, int bl, int br)
+        {
+            var bmp = new Bitmap(300, 200, format);
+            bmp.SetResolution(96, 96);
+            var pal = bmp.Palette;
+            for (int i = 0; i < palette.Length && i < pal.Entries.Length; i++) pal.Entries[i] = palette[i];
+            bmp.Palette = pal;
+            var data = bmp.LockBits(new Rectangle(0, 0, 300, 200), System.Drawing.Imaging.ImageLockMode.WriteOnly, format);
+            try
+            {
+                bool oneBit = format == System.Drawing.Imaging.PixelFormat.Format1bppIndexed;
+                var row = new byte[data.Stride];
+                for (int y = 0; y < 200; y++)
+                {
+                    Array.Clear(row, 0, row.Length);
+                    for (int x = 0; x < 300; x++)
+                    {
+                        int v = y < 100 ? (x < 150 ? tl : tr) : (x < 150 ? bl : br);
+                        if (oneBit) { if (v != 0) row[x >> 3] |= (byte)(0x80 >> (x & 7)); }
+                        else row[x] = (byte)v;
+                    }
+                    Marshal.Copy(row, 0, IntPtr.Add(data.Scan0, y * data.Stride), row.Length);
+                }
+            }
+            finally { bmp.UnlockBits(data); }
+            return bmp;
+        }
+
+        static System.Drawing.Imaging.ImageCodecInfo TestCodec(string mime)
+        {
+            return System.Drawing.Imaging.ImageCodecInfo.GetImageEncoders().First(c => c.MimeType == mime);
+        }
+
+        // 시험용 그림들을 만든다. 돌려주는 값: 파일 경로 목록과, 쪽마다 기대하는 "가로x세로:네 칸 색"
+        List<string> SelftestMakeImages(string dir, List<string> expect)
+        {
+            var files = new List<string>();
+            Color r = TestQuad[0], g = TestQuad[1], b = TestQuad[2], y = TestQuad[3];
+            string p;
+
+            // 1) 24비트 PNG → 압축 데이터 그대로
+            p = Path.Combine(dir, "01 rgb.png");
+            using (var bmp = TestQuadBitmap(r, g, b, y, System.Drawing.Imaging.PixelFormat.Format24bppRgb)) bmp.Save(p, System.Drawing.Imaging.ImageFormat.Png);
+            files.Add(p); expect.Add("225x150:ff0000,00ff00,0000ff,ffff00");
+
+            // 2) 투명한 칸이 있는 PNG → 흰 바탕에 합쳐짐
+            p = Path.Combine(dir, "02 alpha.png");
+            using (var bmp = TestQuadBitmap(Color.FromArgb(0, 255, 0, 0), g, b, y, System.Drawing.Imaging.PixelFormat.Format32bppArgb)) bmp.Save(p, System.Drawing.Imaging.ImageFormat.Png);
+            files.Add(p); expect.Add("225x150:ffffff,00ff00,0000ff,ffff00");
+
+            // 3) 회전 정보(EXIF 방향 6)가 있는 JPEG → 시계 방향으로 90° 돌아간 모습(세로)으로 들어가야 함
+            p = Path.Combine(dir, "03 rotated.jpg");
+            using (var bmp = TestQuadBitmap(r, g, b, y, System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+            {
+                var pi = (System.Drawing.Imaging.PropertyItem)System.Runtime.Serialization.FormatterServices.GetUninitializedObject(typeof(System.Drawing.Imaging.PropertyItem));
+                pi.Id = 0x0112; pi.Type = 3; pi.Len = 2; pi.Value = new byte[] { 6, 0 };
+                bmp.SetPropertyItem(pi);
+                var ep = new System.Drawing.Imaging.EncoderParameters(1);
+                ep.Param[0] = new System.Drawing.Imaging.EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 95L);
+                bmp.Save(p, TestCodec("image/jpeg"), ep);
+            }
+            files.Add(p); expect.Add("150x225:0000ff,ff0000,ffff00,00ff00");
+
+            // 4) GIF, 5) BMP → 풀어서 무손실로
+            p = Path.Combine(dir, "04 anim.gif");
+            using (var bmp = TestQuadBitmap(r, g, b, y, System.Drawing.Imaging.PixelFormat.Format24bppRgb)) bmp.Save(p, System.Drawing.Imaging.ImageFormat.Gif);
+            files.Add(p); expect.Add("225x150:ff0000,00ff00,0000ff,ffff00");
+            p = Path.Combine(dir, "05 plain.bmp");
+            using (var bmp = TestQuadBitmap(r, g, b, y, System.Drawing.Imaging.PixelFormat.Format24bppRgb)) bmp.Save(p, System.Drawing.Imaging.ImageFormat.Bmp);
+            files.Add(p); expect.Add("225x150:ff0000,00ff00,0000ff,ffff00");
+
+            // 6) 두 쪽짜리 TIFF → 두 장 (둘째 쪽은 좌우가 바뀐 그림)
+            p = Path.Combine(dir, "06 twopage.tif");
+            using (var f1 = TestQuadBitmap(r, g, b, y, System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+            using (var f2 = TestQuadBitmap(g, r, y, b, System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+            {
+                var ep = new System.Drawing.Imaging.EncoderParameters(1);
+                ep.Param[0] = new System.Drawing.Imaging.EncoderParameter(System.Drawing.Imaging.Encoder.SaveFlag, (long)System.Drawing.Imaging.EncoderValue.MultiFrame);
+                f1.Save(p, TestCodec("image/tiff"), ep);
+                ep.Param[0] = new System.Drawing.Imaging.EncoderParameter(System.Drawing.Imaging.Encoder.SaveFlag, (long)System.Drawing.Imaging.EncoderValue.FrameDimensionPage);
+                f1.SaveAdd(f2, ep);
+                ep.Param[0] = new System.Drawing.Imaging.EncoderParameter(System.Drawing.Imaging.Encoder.SaveFlag, (long)System.Drawing.Imaging.EncoderValue.Flush);
+                f1.SaveAdd(ep);
+            }
+            files.Add(p); expect.Add("225x150:ff0000,00ff00,0000ff,ffff00"); expect.Add("225x150:00ff00,ff0000,ffff00,0000ff");
+
+            // 7) 팔레트 PNG(회색 네 단계) → 팔레트째 그대로
+            p = Path.Combine(dir, "07 palette.png");
+            var grays = new[] { Color.FromArgb(0, 0, 0), Color.FromArgb(85, 85, 85), Color.FromArgb(170, 170, 170), Color.FromArgb(255, 255, 255) };
+            using (var bmp = TestIndexedBitmap(System.Drawing.Imaging.PixelFormat.Format8bppIndexed, grays, 0, 1, 2, 3)) bmp.Save(p, System.Drawing.Imaging.ImageFormat.Png);
+            files.Add(p); expect.Add("225x150:000000,555555,aaaaaa,ffffff");
+
+            // 8) 흑백 1비트 TIFF (스캔 문서 모양)
+            p = Path.Combine(dir, "08 bilevel.tif");
+            using (var bmp = TestIndexedBitmap(System.Drawing.Imaging.PixelFormat.Format1bppIndexed, new[] { Color.Black, Color.White }, 0, 1, 1, 0)) bmp.Save(p, System.Drawing.Imaging.ImageFormat.Tiff);
+            files.Add(p); expect.Add("225x150:000000,ffffff,ffffff,000000");
+            return files;
+        }
+
+        // 뷰어에서 쪽마다 크기(pt)와 네 칸 가운데의 색을 읽어 온다: "가로x세로:색,색,색,색;..."
+        const string ImageProbeJs = @"
+(async function () {
+  try {
+    var doc = window.PDFViewerApplication.pdfDocument, out = [];
+    function hex(d) { return [d[0], d[1], d[2]].map(function (v) { return ('0' + v.toString(16)).slice(-2); }).join(''); }
+    for (var n = 1; n <= doc.numPages; n++) {
+      var page = await doc.getPage(n);
+      var vp = page.getViewport({ scale: 1 });
+      var c = document.createElement('canvas');
+      c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+      var ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.fillStyle = '#808080'; ctx.fillRect(0, 0, c.width, c.height);
+      await page.render({ canvasContext: ctx, viewport: vp }).promise;
+      var pts = [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]];
+      var cols = pts.map(function (p) { return hex(ctx.getImageData(Math.floor(c.width * p[0]), Math.floor(c.height * p[1]), 1, 1).data); });
+      out.push(Math.round(vp.width) + 'x' + Math.round(vp.height) + ':' + cols.join(','));
+    }
+    chrome.webview.postMessage('testresult|' + out.join(';'));
+  } catch (e) { chrome.webview.postMessage('testresult|error:' + e); }
+})();";
+
+        // "가로x세로:색,..." 두 개가 같은지 (색은 채널마다 tol까지 달라도 됨: JPEG는 조금 달라진다)
+        static bool ProbeMatches(string actual, string expected, int tol)
+        {
+            string[] a = actual.Split(':'), e = expected.Split(':');
+            if (a.Length != 2 || e.Length != 2 || a[0] != e[0]) return false;
+            string[] ac = a[1].Split(','), ec = e[1].Split(',');
+            if (ac.Length != ec.Length) return false;
+            for (int i = 0; i < ac.Length; i++)
+            {
+                if (ac[i].Length != 6 || ec[i].Length != 6) return false;
+                for (int k = 0; k < 6; k += 2)
+                {
+                    int x = Convert.ToInt32(ac[i].Substring(k, 2), 16), y = Convert.ToInt32(ec[i].Substring(k, 2), 16);
+                    if (Math.Abs(x - y) > tol) return false;
+                }
+            }
+            return true;
+        }
+
+        async Task<string> SelftestProbePdf(string pdf, string shotName)
+        {
+            var tab = await NewTab(pdf);
+            tab.ReadyTcs = new TaskCompletionSource<bool>();
+            await WithTimeout(tab.ReadyTcs.Task, 30000);
+            await Task.Delay(500);
+            string r = await tab.EvalTestAsync(ImageProbeJs);
+            if (shotName != null) await tab.CaptureShotPublic(shotName);
+            RemoveTab(tab);
+            return r;
+        }
+
+        static int CountPdfPages(string pdf)
+        {
+            string text = Encoding.GetEncoding(28591).GetString(File.ReadAllBytes(pdf));
+            int n = 0, i = 0;
+            while ((i = text.IndexOf("/Type /Page /Parent", i, StringComparison.Ordinal)) >= 0) { n++; i += 10; }
+            return n;
+        }
+
+        async Task<bool> SelftestImagesToPdf(DocTab back)
+        {
+            bool ok = true;
+            try
+            {
+                string dir = Path.Combine(SelftestDir, "img2pdf");
+                Directory.CreateDirectory(dir);
+                var expect = new List<string>();
+                var files = SelftestMakeImages(dir, expect);
+
+                // 1) 그림 크기 그대로, PDF 하나로
+                string merged = Path.Combine(dir, "merged.pdf");
+                var sw = Stopwatch.StartNew();
+                var res = await ImagePdf.RunJobsAsync(new List<ImageJob> { new ImageJob(files, merged) }, PageFit.Image, CancellationToken.None, null);
+                SelftestLog("TOOL img2pdf pages=" + res.Pages + " failed=" + res.Failed.Count + " bytes=" + (File.Exists(merged) ? new FileInfo(merged).Length : 0) +
+                    " " + sw.ElapsedMilliseconds + "ms" + (res.Failed.Count > 0 ? " : " + string.Join(" / ", res.Failed) : ""));
+                if (res.Pages != expect.Count || res.Failed.Count != 0) ok = false;
+                else
+                {
+                    string probe = await SelftestProbePdf(merged, "07_img2pdf.png");
+                    string[] got = probe.Split(';');
+                    SelftestLog("TOOL img2pdf view → " + probe);
+                    if (got.Length != expect.Count) ok = false;
+                    else
+                    {
+                        for (int i = 0; i < got.Length; i++)
+                        {
+                            if (!ProbeMatches(got[i], expect[i], 40)) { SelftestLog("TOOL img2pdf page " + (i + 1) + " MISMATCH want " + expect[i] + " got " + got[i]); ok = false; }
+                        }
+                    }
+                }
+
+                // 2) A4에 맞춤: 가로 그림은 가로 A4, 세로로 돌아간 사진은 세로 A4
+                string a4 = Path.Combine(dir, "a4.pdf");
+                var resA4 = await ImagePdf.RunJobsAsync(new List<ImageJob> { new ImageJob(new[] { files[0], files[2] }, a4) }, PageFit.A4, CancellationToken.None, null);
+                if (resA4.Pages != 2) { SelftestLog("TOOL img2pdf a4 pages=" + resA4.Pages); ok = false; }
+                else
+                {
+                    string probe = await SelftestProbePdf(a4, null);
+                    SelftestLog("TOOL img2pdf a4 view → " + probe);
+                    // 842×595 쪽에 3:2 그림이 꽉 차게(위아래로 17pt 남음), 595×842 쪽에 2:3 그림이 가운데(위아래로 25pt 남음)
+                    string[] got = probe.Split(';');
+                    if (got.Length != 2 || !ProbeMatches(got[0], "842x595:ff0000,00ff00,0000ff,ffff00", 40) || !ProbeMatches(got[1], "595x842:0000ff,ff0000,ffff00,00ff00", 40)) ok = false;
+                }
+
+                // 3) 읽을 수 없는 파일은 건너뛰고 나머지로 만든다
+                string junk = Path.Combine(dir, "09 broken.png");
+                File.WriteAllBytes(junk, new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 });
+                string partial = Path.Combine(dir, "partial.pdf");
+                var resBad = await ImagePdf.RunJobsAsync(new List<ImageJob> { new ImageJob(new[] { files[0], junk }, partial) }, PageFit.Image, CancellationToken.None, null);
+                SelftestLog("TOOL img2pdf broken → pages=" + resBad.Pages + " failed=" + string.Join(" / ", resBad.Failed));
+                if (resBad.Pages != 1 || resBad.Failed.Count != 1) ok = false;
+
+                // 4) 탐색기 우클릭 경로: 파일마다 따로 뜬 프로그램들이 한데 모여 PDF 하나를 만드는지 (이름 순서: 1, 2, 10)
+                string cli = Path.Combine(dir, "cli");
+                Directory.CreateDirectory(cli);
+                string c1 = Path.Combine(cli, "그림 1.png"), c2 = Path.Combine(cli, "그림 2.jpg"), c10 = Path.Combine(cli, "그림 10.bmp");
+                File.Copy(files[0], c1, true); File.Copy(files[2], c2, true); File.Copy(files[4], c10, true);
+                string flags = " --queue selftest --no-open --quiet ";
+                var procs = new List<Process>();
+                foreach (var f in new[] { c10, c1, c2 })
+                {
+                    var psi = new ProcessStartInfo(Application.ExecutablePath, "--img2pdf-merge" + flags + "\"" + f + "\"");
+                    psi.UseShellExecute = false;
+                    procs.Add(Process.Start(psi));
+                }
+                await Task.Run((Action)delegate { foreach (var pr in procs) pr.WaitForExit(40000); });
+                string mergedCli = Path.Combine(cli, "그림 1 외 2장.pdf");
+                var pdfs = Directory.GetFiles(cli, "*.pdf").Select(Path.GetFileName).ToArray();
+                SelftestLog("TOOL img2pdf shell-merge → " + string.Join(" | ", pdfs) + " exit=" + string.Join(",", procs.Select(pr => pr.HasExited ? pr.ExitCode.ToString() : "running")));
+                if (pdfs.Length != 1 || !File.Exists(mergedCli) || CountPdfPages(mergedCli) != 3) ok = false;
+                else
+                {
+                    string probe = await SelftestProbePdf(mergedCli, null);
+                    SelftestLog("TOOL img2pdf shell-merge view → " + probe);
+                    string[] got = probe.Split(';');
+                    if (got.Length != 3 || !ProbeMatches(got[0], expect[0], 40) || !ProbeMatches(got[1], expect[2], 40) || !ProbeMatches(got[2], expect[4], 40)) ok = false;
+                }
+
+                // 5) "PDF로 변환"(그림마다 하나씩): 두 파일 → PDF 두 개, 이미 있는 이름은 비켜 감
+                File.WriteAllText(Path.Combine(cli, "그림 2.pdf"), "이미 있던 파일");
+                procs.Clear();
+                foreach (var f in new[] { c1, c2 })
+                {
+                    var psi = new ProcessStartInfo(Application.ExecutablePath, "--img2pdf" + flags + "\"" + f + "\"");
+                    psi.UseShellExecute = false;
+                    procs.Add(Process.Start(psi));
+                }
+                await Task.Run((Action)delegate { foreach (var pr in procs) pr.WaitForExit(40000); });
+                pdfs = Directory.GetFiles(cli, "*.pdf").Select(Path.GetFileName).OrderBy(s => s, StringComparer.Ordinal).ToArray();
+                SelftestLog("TOOL img2pdf shell-each → " + string.Join(" | ", pdfs));
+                if (!File.Exists(Path.Combine(cli, "그림 1.pdf")) || !File.Exists(Path.Combine(cli, "그림 2 (2).pdf")) ||
+                    File.ReadAllText(Path.Combine(cli, "그림 2.pdf")) != "이미 있던 파일" || pdfs.Length != 4) ok = false;
+
+                // 6) 명령줄용: 창 없이 준 순서대로
+                string direct = Path.Combine(cli, "direct.pdf");
+                var dpsi = new ProcessStartInfo(Application.ExecutablePath, "--img2pdf-out \"" + direct + "\" --a4 \"" + c2 + "\" \"" + c1 + "\"");
+                dpsi.UseShellExecute = false;
+                var dp = Process.Start(dpsi);
+                await Task.Run((Action)delegate { dp.WaitForExit(40000); });
+                SelftestLog("TOOL img2pdf direct → exit=" + (dp.HasExited ? dp.ExitCode.ToString() : "running") + " pages=" + (File.Exists(direct) ? CountPdfPages(direct) : -1));
+                if (!dp.HasExited || dp.ExitCode != 0 || !File.Exists(direct) || CountPdfPages(direct) != 2) ok = false;
+
+                // 7) (선택) 결과폴더\extra-images 에 그림을 넣어 두면 전부 PDF 하나로 만들고, 뷰어가 그린 쪽들을 PNG로 내보낸다.
+                //    여러 형식의 그림을 원본과 픽셀 단위로 비교하는 바깥 도구(파이썬 등)를 위한 것.
+                string extra = Path.Combine(SelftestDir, "extra-images");
+                if (Directory.Exists(extra))
+                {
+                    var list = ImagePdf.SortNatural(Directory.GetFiles(extra));
+                    string extraPdf = Path.Combine(SelftestDir, "extra.pdf");
+                    var sw2 = Stopwatch.StartNew();
+                    var r2 = await ImagePdf.RunJobsAsync(new List<ImageJob> { new ImageJob(list, extraPdf) }, PageFit.Image, CancellationToken.None, null);
+                    SelftestLog("TOOL img2pdf extra images=" + list.Count + " pages=" + r2.Pages + " " + sw2.ElapsedMilliseconds + "ms failed=" + string.Join(" / ", r2.Failed));
+                    File.WriteAllLines(Path.Combine(SelftestDir, "extra-order.txt"), list.Select(f => Path.GetFileName(f)).ToArray(), new UTF8Encoding(false));
+                    if (r2.Pages > 0)
+                    {
+                        var tab = await NewTab(extraPdf);
+                        tab.ReadyTcs = new TaskCompletionSource<bool>();
+                        await WithTimeout(tab.ReadyTcs.Task, 60000);
+                        tab.ExportDir = Path.Combine(SelftestDir, "extra-pages");
+                        string pageList = string.Join(",", Enumerable.Range(1, r2.Pages).Select(i => i.ToString()));
+                        int rendered = await RunJsExport(tab, null, null, "pages2img|{\"format\":\"png\",\"dpi\":96,\"pages\":[" + pageList + "]}");
+                        SelftestLog("TOOL img2pdf extra rendered=" + rendered);
+                        if (rendered != r2.Pages) ok = false;
+                        RemoveTab(tab);
+                    }
+                }
+
+                if (back != null && docs.Contains(back)) SelectTab(back);
+            }
+            catch (Exception ex) { SelftestLog("TOOL img2pdf FAILED " + ex); ok = false; }
             return ok;
         }
     }
@@ -2019,6 +2530,9 @@ namespace PdfViewerApp
                 case "officetopdf":
                     Form.ToolOfficeToPdf();
                     break;
+                case "imagestopdf":
+                    Form.ToolImagesToPdf(null);
+                    break;
                 case "openurl":
                     Util.OpenExternal(arg);
                     break;
@@ -2440,11 +2954,56 @@ namespace PdfViewerApp
         }
     }
 
+    // 창의 실제 화면 배율에 대화상자를 맞춘다.
+    // 이 프로그램에서는 WinForms가 화면 배율을 100%(DeviceDpi 96)로만 알고 있어 대화상자의 칸 크기를 스스로 키우지 못하는데,
+    // 글자는 실제 배율(예: 175%)로 그려져서 칸보다 커지고 잘린다. 그래서 그 차이만큼 폼과 안의 컨트롤을 직접 키운다.
+    static class DpiUtil
+    {
+        [DllImport("user32.dll")]
+        static extern uint GetDpiForWindow(IntPtr hwnd);
+        [DllImport("user32.dll")]
+        static extern uint GetDpiForSystem();
+
+        public static int Of(Control c)
+        {
+            try
+            {
+                if (c != null && c.IsHandleCreated)
+                {
+                    int d = (int)GetDpiForWindow(c.Handle);
+                    if (d > 0) return d;
+                }
+            }
+            catch { }
+            try { int d = (int)GetDpiForSystem(); if (d > 0) return d; } catch { }
+            return 96;
+        }
+
+        // 폼이 뜨기 직전(OnLoad의 맨 앞)에 한 번 부른다. 글꼴은 pt 단위라 손대지 않는다.
+        public static void FitForm(Form f)
+        {
+            int real = Of(f.Owner != null ? (Control)f.Owner : f);
+            float k = real / (float)Math.Max(1, f.DeviceDpi);
+            if (Math.Abs(k - 1f) < 0.02f) return;
+            f.Scale(new SizeF(k, k));
+        }
+    }
+
     // ===================================================================================
     //  진행 창
     // ===================================================================================
     class ProgressForm : Form
     {
+        public bool NoActivate;   // 자체 시험에서 화면 밖에 띄울 때 포커스를 가져오지 않게
+        protected override bool ShowWithoutActivation { get { return NoActivate; } }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            DpiUtil.FitForm(this);
+            base.OnLoad(e);
+            if (!Modal && StartPosition == FormStartPosition.CenterScreen) CenterToScreen();
+        }
+
         readonly Label label;
         public readonly CancellationTokenSource Cts = new CancellationTokenSource();
         bool finished;
@@ -2512,6 +3071,8 @@ namespace PdfViewerApp
     {
         protected readonly Button okButton = new Button();
         protected readonly Button cancelButton = new Button();
+        public bool NoActivate;   // 자체 시험에서 화면 밖에 띄울 때 포커스를 가져오지 않게
+        protected override bool ShowWithoutActivation { get { return NoActivate; } }
 
         protected DialogBase(string title, int width, int height)
         {
@@ -2550,14 +3111,45 @@ namespace PdfViewerApp
             return l;
         }
 
+        // 선택 단추(라디오)는 같은 부모 안에서 하나만 선택된다. 한 대화상자에 선택 묶음이 둘 이상이면
+        // 묶음마다 BeginGroup ~ EndGroup 으로 감싸야 서로의 선택을 풀지 않는다. (좌표는 대화상자 기준 그대로 쓴다)
+        Panel currentGroup;
+
+        protected void BeginGroup(int x, int y, int w, int h)
+        {
+            currentGroup = new Panel();
+            currentGroup.Location = new Point(x, y);
+            currentGroup.Size = new Size(w, h);
+            currentGroup.Margin = new Padding(0);
+            Controls.Add(currentGroup);
+        }
+
+        protected void EndGroup()
+        {
+            currentGroup = null;
+        }
+
+        void AddToGroupOrForm(Control c, int x, int y)
+        {
+            if (currentGroup != null)
+            {
+                c.Location = new Point(x - currentGroup.Left, y - currentGroup.Top);
+                currentGroup.Controls.Add(c);
+            }
+            else
+            {
+                c.Location = new Point(x, y);
+                Controls.Add(c);
+            }
+        }
+
         protected RadioButton AddRadio(string text, int x, int y, int w, bool isChecked)
         {
             var r = new RadioButton();
             r.Text = text;
-            r.Location = new Point(x, y);
             r.Size = new Size(w, 22);
             r.Checked = isChecked;
-            Controls.Add(r);
+            AddToGroupOrForm(r, x, y);
             return r;
         }
 
@@ -2575,10 +3167,15 @@ namespace PdfViewerApp
         protected TextBox AddText(int x, int y, int w)
         {
             var t = new TextBox();
-            t.Location = new Point(x, y);
             t.Size = new Size(w, 23);
-            Controls.Add(t);
+            AddToGroupOrForm(t, x, y);
             return t;
+        }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            DpiUtil.FitForm(this);   // 화면 배율에 맞게 키운 뒤에 가운데로 놓이도록 base보다 먼저
+            base.OnLoad(e);
         }
 
         // 확인을 눌렀을 때 입력 검사. 문제가 있으면 메시지를 돌려주고 닫히지 않는다.
@@ -2645,16 +3242,21 @@ namespace PdfViewerApp
         public RotateDialog(int currentPage, int pageCount) : base("페이지 회전 저장", 380, 268)
         {
             AddLabel("회전할 페이지", 16, 12, 200, 20);
+            BeginGroup(0, 32, 380, 84);
             scope = new PageScope(this, 34, currentPage, pageCount, AddRadio, AddText);
+            EndGroup();
             AddLabel("방향", 16, 122, 200, 20);
+            BeginGroup(0, 142, 186, 80);
             cw = AddRadio("시계 방향 90°", 24, 144, 150, true);
             ccw = AddRadio("반시계 방향 90°", 24, 170, 150, false);
             half = AddRadio("180°", 24, 196, 150, false);
+            EndGroup();
             AddLabel("회전은 파일에 저장되며(주석·책갈피 유지), 다른 뷰어에서도 돌아간 채로 보입니다.", 190, 144, 180, 60);
         }
 
         public List<int> Pages { get { return scope.Pages; } }
         public int Delta { get { return cw.Checked ? 90 : (ccw.Checked ? 270 : 180); } }
+        public void TestChooseAllPages() { scope.All.Checked = true; }   // 자체 시험용: "모든 페이지"를 누른 것과 같음
         protected override string ValidateInput() { return scope.Validate(); }
     }
 
@@ -2687,10 +3289,14 @@ namespace PdfViewerApp
         public PagesToImagesDialog(int currentPage, int pageCount) : base("PDF → 이미지", 380, 268)
         {
             AddLabel("페이지", 16, 12, 200, 20);
+            BeginGroup(0, 32, 380, 84);
             scope = new PageScope(this, 34, currentPage, pageCount, AddRadio, AddText);
+            EndGroup();
             AddLabel("형식", 16, 122, 100, 20);
+            BeginGroup(0, 142, 186, 28);
             png = AddRadio("PNG", 24, 144, 70, true);
             jpg = AddRadio("JPG", 100, 144, 70, false);
+            EndGroup();
             AddLabel("해상도", 190, 122, 100, 20);
             dpi = new ComboBox();
             dpi.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -2714,6 +3320,41 @@ namespace PdfViewerApp
         }
 
         protected override string ValidateInput() { return scope.Validate(); }
+        public void TestChooseJpgThenAllPages() { jpg.Checked = true; scope.All.Checked = true; }   // 자체 시험용
+    }
+
+    // 그림 → PDF: 쪽 크기와, 그림이 여러 개일 때 합칠지 따로 만들지
+    class ImagesToPdfDialog : DialogBase
+    {
+        readonly RadioButton fitImage, fitA4, merge, each;
+
+        public ImagesToPdfDialog(IList<string> files) : base("그림 → PDF", 440, 304)
+        {
+            string names = string.Join(", ", files.Take(3).Select(f => Path.GetFileName(f))) + (files.Count > 3 ? " …" : "");
+            AddLabel(string.Format("그림 {0}개: {1}", files.Count, names), 16, 12, 408, 36);
+            AddLabel("쪽 크기 (탐색기 우클릭 변환에도 적용됩니다)", 16, 54, 408, 20);
+            BeginGroup(0, 74, 440, 52);
+            bool a4 = ImagePdf.FitSetting == PageFit.A4;
+            fitImage = AddRadio("그림 크기 그대로 (여백 없이 그림만)", 24, 76, 390, !a4);
+            fitA4 = AddRadio("A4 용지에 맞춤 (가로·세로 자동)", 24, 102, 390, a4);
+            EndGroup();
+            AddLabel("그림이 여러 개일 때", 16, 136, 200, 20);
+            BeginGroup(0, 156, 440, 52);
+            bool together = ImagePdf.MergeSetting;
+            merge = AddRadio("PDF 하나로 합치기 (파일 이름 순서)", 24, 158, 390, together);
+            each = AddRadio("그림마다 PDF 하나씩 (그림 옆에 저장)", 24, 184, 390, !together);
+            EndGroup();
+            if (files.Count < 2) { merge.Enabled = false; each.Enabled = false; }
+            AddLabel("JPG는 화질 그대로, PNG 등은 무손실로 들어갑니다. 쪽 순서는 만든 뒤 왼쪽 썸네일에서 바꿀 수 있습니다.", 16, 216, 408, 40);
+        }
+
+        public PageFit Fit { get { return fitA4.Checked ? PageFit.A4 : PageFit.Image; } }
+        public bool Merge { get { return !each.Enabled || merge.Checked; } }
+        public void TestChoose(bool a4, bool together)   // 자체 시험용
+        {
+            if (a4) fitA4.Checked = true; else fitImage.Checked = true;
+            if (together) merge.Checked = true; else each.Checked = true;
+        }
     }
 
     class PasswordDialog : DialogBase
@@ -2737,14 +3378,30 @@ namespace PdfViewerApp
     // ===================================================================================
     static class Tools
     {
+        public const string GsHelp = "PDF24 Creator(Ghostscript가 들어 있음) 또는 Ghostscript를 설치하면 쓸 수 있습니다.\n" +
+                                     "찾아본 곳: C:\\Program Files\\PDF24\\gs, C:\\Program Files\\gs";
+
         public static string FindGs()
         {
+            string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
             foreach (var p in new[] {
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PDF24", "gs", "bin", "gswin64c.exe"),
+                Path.Combine(pf, "PDF24", "gs", "bin", "gswin64c.exe"),
                 @"C:\Program Files\PDF24\gs\bin\gswin64c.exe",
                 @"C:\Program Files (x86)\PDF24\gs\bin\gswin64c.exe" })
             {
                 if (File.Exists(p)) return p;
+            }
+            // 따로 설치한 Ghostscript: C:\Program Files\gs\gs10.xx\bin (여러 버전이면 이름이 가장 뒤인 것)
+            foreach (var root in new[] { Path.Combine(pf, "gs"), @"C:\Program Files\gs" })
+            {
+                try
+                {
+                    if (!Directory.Exists(root)) continue;
+                    string found = Directory.GetDirectories(root).OrderByDescending(d => d, StringComparer.OrdinalIgnoreCase)
+                        .Select(d => Path.Combine(d, "bin", "gswin64c.exe")).FirstOrDefault(File.Exists);
+                    if (found != null) return found;
+                }
+                catch { }
             }
             return null;
         }
@@ -3103,8 +3760,11 @@ namespace PdfViewerApp
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         static extern void SHAddToRecentDocs(uint uFlags, string pv);
 
+        public static bool NoRecent;   // 자체 시험 중에는 시험용 파일을 최근 문서(뷰어 목록, Windows 최근 항목)에 남기지 않는다
+
         public static void AddToRecent(string path)
         {
+            if (NoRecent) return;
             try { SHAddToRecentDocs(3, path); } catch { }
             RecentList.Add(path);
         }

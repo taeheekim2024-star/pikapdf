@@ -37,6 +37,7 @@
   .foot { margin-top: 28px; font-size: 12px; color: #9aa1ab; line-height: 1.6; }
   .notice { display: flex; gap: 12px; align-items: flex-start; margin: 0 0 22px; padding: 11px 14px; border: 1px solid #c9d8f5;
             border-left: 4px solid var(--brand); border-radius: 8px; background: #eef3fd; font-size: 14px; color: #1e2a3a; }
+  .notice[hidden] { display: none; }   /* display:flex 가 hidden 속성을 이기지 않게 (공지가 없으면 띠도 없음) */
   .notice p { margin: 0; flex: 1; line-height: 1.5; }
   .notice a { color: var(--brand-dark); font-weight: 600; margin-left: 6px; }
   .notice button { border: none; background: none; cursor: pointer; color: #6b7482; font-size: 15px; line-height: 1; padding: 0 2px; }
@@ -54,12 +55,13 @@
   <div class="notice" id="notice" hidden></div>
   <div class="actions">
     <button class="btn" id="open">파일 열기 <span class="key">Ctrl+O</span></button>
+    <button class="btn secondary" id="images">그림을 PDF로</button>
     <button class="btn secondary" id="convert">오피스·한글 문서를 PDF로</button>
   </div>
-  <div class="drop">PDF 파일을 이 창에 끌어다 놓아도 열립니다</div>
+  <div class="drop">PDF 파일을 이 창에 끌어다 놓으면 열리고, 그림 파일을 놓으면 PDF로 바꿉니다</div>
   <h2>최근 문서</h2>
   <ul class="recent" id="recent"><li class="empty">아직 연 문서가 없습니다</li></ul>
-  <div class="foot">도구 메뉴: 페이지 회전 저장 · 용량 줄이기 · 잠금 해제 · 이미지 추출 · PDF → 이미지 / 텍스트 / Word · 오피스 / 한글 → PDF</div>
+  <div class="foot">도구 메뉴: 페이지 회전 저장 · 용량 줄이기 · 잠금 해제 · 이미지 추출 · PDF → 이미지 / 텍스트 / Word · 그림 → PDF · 오피스 / 한글 → PDF</div>
 </div>
 <script>
 (function () {
@@ -67,6 +69,7 @@
   function post(s) { if (wv) wv.postMessage(s); }
   document.getElementById("open").onclick = function () { post("open"); };
   document.getElementById("convert").onclick = function () { post("officetopdf"); };
+  document.getElementById("images").onclick = function () { post("imagestopdf"); };
   // 프로젝트 공지 (notice.json: id, text/text_ko, url(https), label/label_ko, kind, until) — 비어 있으면 안 보임
   fetch("notice.json", { cache: "no-store" })
     .then(function (r) { return r.ok ? r.json() : null; })

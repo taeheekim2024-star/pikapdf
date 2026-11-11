@@ -1,5 +1,7 @@
 ﻿# PDF 뷰어를 이 사용자 계정에 등록한다 (관리자 권한 불필요).
 #  - PDF 우클릭 > 연결 프로그램 목록과 설정 > 기본 앱 목록에 나타나게 함
+#  - 그림 파일 우클릭 메뉴에 "PDF로 변환", "PDF 하나로 합치기" 추가
+#    (Windows 11에서는 우클릭 > "추가 옵션 표시" 안에, 또는 Shift+우클릭 메뉴에 나타남)
 #  - 시작 메뉴와 바탕화면에 바로가기
 # 실행:  powershell -ExecutionPolicy Bypass -File .\등록.ps1
 $ErrorActionPreference = 'Stop'
@@ -41,6 +43,23 @@ Set-Val $cap 'ApplicationDescription' 'PDF 보기, 형광펜, 메모, 서명, �
 Set-Val "$cap\FileAssociations" '.pdf' $progId
 Set-Val 'HKCU:\Software\RegisteredApplications' $appName 'Software\PDF뷰어\Capabilities'
 
+# 그림 파일 우클릭 메뉴 (확장자마다 등록: 기본 앱이 무엇이든 나타남)
+#   PDF로 변환        = 그림마다 PDF 하나 (그림 옆에 같은 이름으로)
+#   PDF 하나로 합치기 = 고른 그림 전부를 PDF 하나로 (파일 이름 순서)
+# MultiSelectModel=Player: 파일을 몇 개 골라도 메뉴가 나타난다 (기본값은 15개까지)
+$imageExts = '.jpg', '.jpeg', '.jpe', '.jfif', '.png', '.bmp', '.dib', '.gif', '.tif', '.tiff', '.webp', '.heic', '.heif', '.avif'
+foreach ($ext in $imageExts) {
+    $shell = "HKCU:\Software\Classes\SystemFileAssociations\$ext\shell"
+    Set-Default "$shell\PdfViewer.ToPdf" 'PDF로 변환'
+    Set-Val     "$shell\PdfViewer.ToPdf" 'Icon' "$exe,0"
+    Set-Val     "$shell\PdfViewer.ToPdf" 'MultiSelectModel' 'Player'
+    Set-Default "$shell\PdfViewer.ToPdf\command" "`"$exe`" --img2pdf `"%1`""
+    Set-Default "$shell\PdfViewer.ToPdfMerge" 'PDF 하나로 합치기'
+    Set-Val     "$shell\PdfViewer.ToPdfMerge" 'Icon' "$exe,0"
+    Set-Val     "$shell\PdfViewer.ToPdfMerge" 'MultiSelectModel' 'Player'
+    Set-Default "$shell\PdfViewer.ToPdfMerge\command" "`"$exe`" --img2pdf-merge `"%1`""
+}
+
 # 바로가기
 $ws = New-Object -ComObject WScript.Shell
 foreach ($dir in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('DesktopDirectory'))) {
@@ -62,3 +81,4 @@ if (-not ('Win32.Shell32Notify' -as [type])) {
 
 "등록 완료."
 "기본 앱으로 쓰려면: PDF 파일 우클릭 > 연결 프로그램 > 다른 앱 선택 > '$appName' > 항상"
+"그림 파일 우클릭: 'PDF로 변환', 'PDF 하나로 합치기' (Windows 11은 '추가 옵션 표시' 안 또는 Shift+우클릭)"

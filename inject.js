@@ -158,7 +158,7 @@
     if (t && t.id === "fileInput") { e.preventDefault(); e.stopImmediatePropagation(); post("open"); }
   }, true);
 
-  // 5) 파일 끌어다 놓기 → 호스트가 실제 경로로 연다 (페이지 관리자 안으로의 끌어놓기는 PDF.js에 맡긴다)
+  // 5) 파일 끌어다 놓기 → 호스트가 실제 경로로 연다 (페이지 관리자 안으로의 끌어놓기는 PDF.js에 맡긴다: 그림을 쪽으로 끼워 넣기 등)
   function hasFiles(e) {
     try { return !!e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types, "Files") >= 0; }
     catch (x) { return false; }
@@ -175,8 +175,11 @@
   window.addEventListener("drop", function (e) {
     if (!hasFiles(e) || insideViewsManager(e)) return;
     e.preventDefault(); e.stopImmediatePropagation();
-    var files = Array.prototype.filter.call(e.dataTransfer.files || [], function (f) { return /\.pdf$/i.test(f.name); });
-    if (!files.length) { toast("PDF 파일만 열 수 있습니다", true); return; }
+    // PDF는 탭으로 열고, 그림 파일은 호스트가 PDF로 바꾸는 창을 띄운다
+    var files = Array.prototype.filter.call(e.dataTransfer.files || [], function (f) {
+      return /\.(pdf|jpe?g|jpe|jfif|png|bmp|dib|gif|tiff?|webp|heic|heif|avif)$/i.test(f.name);
+    });
+    if (!files.length) { toast("PDF나 그림 파일만 열 수 있습니다", true); return; }
     try { wv.postMessageWithAdditionalObjects("drop", files); }
     catch (x) { toast("파일을 열지 못했습니다: " + x, true); }
   }, true);

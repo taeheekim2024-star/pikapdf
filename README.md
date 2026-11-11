@@ -16,7 +16,8 @@ Firefox의 PDF 엔진(PDF.js)을 Windows 내장 WebView2 창에 올린 단독 �
 | 주석 | 형광펜(여러 색), 자유 그리기, 텍스트 메모, 이미지 넣기, 서명, 댓글, 양식 입력 |
 | 저장 | Ctrl+S로 원본에 바로 저장(직전 원본은 자동 백업), 다른 이름으로 저장, 인쇄 |
 | 페이지 | 삭제·잘라내기·복사·추출·순서 바꾸기, 다른 PDF나 이미지 합치기, 회전 저장(주석 유지) |
-| 도구 | 용량 줄이기·잠금 해제(PDF24의 Ghostscript), 이미지 추출, PDF→이미지/텍스트/Word, 오피스·한글 문서→PDF |
+| 도구 | 용량 줄이기·잠금 해제(Ghostscript), 이미지 추출, PDF→이미지/텍스트/Word, 오피스·한글 문서→PDF |
+| 그림→PDF | JPG·PNG·BMP·GIF·TIFF·WebP·HEIC를 PDF로. 여러 장을 하나로 합치기, 탐색기 우클릭 메뉴("PDF로 변환", "PDF 하나로 합치기"). JPG는 다시 압축하지 않아 화질 그대로, PNG 등은 무손실 |
 | 성능 | 더블클릭에서 첫 화면까지 약 1초, 이미 떠 있는 창에 새 탭은 0.1초대 |
 
 안 되는 것: 본문 글자 자체를 고치는 편집(Acrobat Pro 영역), PDF→엑셀/파워포인트, OCR.
@@ -24,10 +25,12 @@ Firefox의 PDF 엔진(PDF.js)을 Windows 내장 WebView2 창에 올린 단독 �
 ## 설치
 
 1. [Releases](https://github.com/taeheekim2024-star/pikapdf/releases)에서 `PikaPDF-Windows-x64.zip`을 받아 원하는 폴더에 풉니다(예: `문서\PDF뷰어`).
-2. 폴더의 `등록.ps1`을 PowerShell로 실행하면 "연결 프로그램" 목록과 시작 메뉴·바탕화면 바로가기가 생깁니다.
+2. 폴더의 `등록.ps1`을 PowerShell로 실행하면 "연결 프로그램" 목록, 그림 파일 우클릭 메뉴("PDF로 변환", "PDF 하나로 합치기"), 시작 메뉴·바탕화면 바로가기가 생깁니다.
 3. PDF 우클릭 → 연결 프로그램 → 다른 앱 선택 → "PDF 뷰어" → 항상.
 
-요구 사항: Windows 10/11 (64비트), WebView2 런타임(Windows 11 기본 포함). 용량 줄이기·잠금 해제는 [PDF24 Creator](https://tools.pdf24.org/)가 설치되어 있을 때, 변환은 Microsoft Office·한컴오피스가 있을 때 동작합니다.
+Windows 11에서는 그림 우클릭 메뉴가 "추가 옵션 표시" 안에 나타납니다(Shift+우클릭이면 바로 나옵니다).
+
+요구 사항: Windows 10/11 (64비트), WebView2 런타임(Windows 11 기본 포함). 용량 줄이기·잠금 해제는 Ghostscript([PDF24 Creator](https://tools.pdf24.org/)에 포함된 것 또는 따로 설치한 것)가 있을 때, 문서 변환은 Microsoft Office·한컴오피스가 있을 때 동작합니다. 그림→PDF는 추가 프로그램 없이 동작합니다(WebP·HEIC는 Windows에 해당 코덱이 있어야 함).
 
 자세한 사용법은 [README.txt](README.txt)를 보세요.
 
@@ -47,6 +50,8 @@ powershell -ExecutionPolicy Bypass -File .\src\build.ps1 # PdfViewer.exe 생성
 
 ```
 src/Program.cs      WinForms 호스트: 탭·헤더·메뉴, 파일 제공(/doc)·저장(/save)·내보내기(/export), 도구, 자체 시험
+src/ImagePdf.cs     그림 → PDF: 작은 PDF 쓰기 코드. JPEG는 그대로(DCT), PNG는 압축 데이터 그대로(Flate+예측기), 나머지는 WIC로 풀어서
+src/ShellConvert.cs 탐색기 우클릭·명령줄 변환(--img2pdf …): 파일마다 따로 뜬 프로세스들이 파이프로 모여 한 번에 처리
 inject.js           PDF.js 뷰어에 주입되는 스크립트: 저장 가로채기, 수정 감지, 단축키, 이미지·텍스트 내보내기
 start/              빈 탭의 시작 화면 (최근 문서, 공지)
 src/patch_pdfjs.py  pdf.js 증분 저장에 "페이지 회전" 변경을 끼워 넣는 패치
@@ -74,8 +79,9 @@ docs/               GitHub Pages 소개 페이지와 notice.json
 ## English
 
 PikaPDF is a small, fast PDF viewer and annotator for Windows: tabs, highlights, notes, signatures,
-page organizing (delete/extract/reorder/merge/rotate), compression and unlocking (via PDF24's
-Ghostscript), image/text/Word export, and Office/Hangul-to-PDF conversion. It runs Mozilla's PDF.js
+page organizing (delete/extract/reorder/merge/rotate), compression and unlocking (via
+Ghostscript), image/text/Word export, images-to-PDF (JPEG embedded without recompression, also from
+the Explorer right-click menu), and Office/Hangul-to-PDF conversion. It runs Mozilla's PDF.js
 inside a WebView2 window; no installer, no account, no telemetry, no ads.
 
 Build on any Windows machine with `setup.ps1` + `src\build.ps1` (only the C# compiler that ships
