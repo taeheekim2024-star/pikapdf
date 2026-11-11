@@ -1,4 +1,4 @@
-﻿# PikaPDF 빌드 준비: pdf.js 배포본과 WebView2 SDK를 내려받아 제자리에 풀고, 회전 저장 패치를 적용한다.
+﻿# PikaPDF 빌드 준비: pdf.js 배포본과 WebView2 SDK를 내려받아 제자리에 풀고, 패치(회전 저장, 서명·주석 박아 넣기)를 적용한다.
 # 실행:  powershell -ExecutionPolicy Bypass -File .\setup.ps1
 #   - 다시 실행해도 안전합니다 (이미 있으면 건너뜀). 패치 적용에는 Python 3이 필요합니다(Windows python 또는 WSL python3).
 $ErrorActionPreference = 'Stop'
@@ -51,8 +51,9 @@ if (-not (Test-Path (Join-Path $root 'WebView2Loader.dll'))) {
     Remove-Item $zipCopy -Force
 }
 
-# 회전 저장 패치 (이미 적용돼 있으면 건너뜀)
-$marker = Select-String -Path (Join-Path $pdfjsDir 'build\pdf.worker.mjs') -Pattern 'PDFVIEWER-PATCH' -Quiet
+# pdf.js 패치: 회전 저장, 서명·주석 박아 넣기. 지금 판(src/patch_pdfjs.py 의 VERSION)이 이미 들어 있으면 건너뛴다.
+# 예전 판으로 패치된 파일이면 스크립트가 먼저 되돌린 뒤 새로 넣는다. (VERSION 을 올리면 아래 문자열도 함께 올릴 것)
+$marker = Select-String -Path (Join-Path $pdfjsDir 'build\pdf.worker.mjs') -Pattern 'PDFVIEWER-PATCH v2' -SimpleMatch -Quiet
 if (-not $marker) {
     $patch = Join-Path $root 'src\patch_pdfjs.py'
     $py = Get-Command python -ErrorAction SilentlyContinue
