@@ -52,6 +52,9 @@
   var exportNext = false;    // 다음 저장은 "추출한 페이지를 다른 파일로"
   var rotateSaveNext = false; // 다음 저장은 "회전 저장" (끝나면 다시 불러옴)
   var cancelled = false;     // 내보내기 취소 요청
+  var flattenAuto = false;   // 저장할 때 서명·그림을 쪽 내용으로 박아 넣기 (호스트의 설정; 문서가 열리면 호스트가 알려 준다)
+  var workerSaved = false;   // 방금 넘어온 저장 데이터가 PDF.js의 저장 처리(SaveDocument)를 거친 것인지
+  var saveFailed = false;    // 방금 PDF.js의 저장 처리가 실패했는지 (그 뒤에 넘어오는 것은 수정 내용이 빠진 원본이다)
 
   // 수정 상태: 주석(annotationStorage) + 페이지 구조(삭제·순서·합치기)
   var annDirty = false;
@@ -128,6 +131,95 @@
       .then(function () { return app.save(); })
       .then(null, function (e) { rotateSaveNext = false; toast("회전 저장 실패: " + e, true); })
       .then(function () { tr.pageRotations = null; });
+  }
+
+  // 서명·주석 박아 넣기: pdf.js(패치됨)가 저장할 때 주석의 모양을 쪽 내용으로 옮기고 주석 목록에서 뺀다.
+  // 그러면 다른 프로그램에서 주석처럼 따로 집어 옮기거나 복사·삭제할 수 없다.
+  //   평소 저장: 설정이 켜져 있으면 이번 저장에서 새로 넣었거나 고친 서명·그림(Stamp)만
+  //   도구 메뉴: 고른 종류를 문서에 이미 있던 것까지 전부 (끝나면 다시 불러옴)
+  function setFlattenDefault() {
+    try {
+      var tr = app && app.pdfDocument && app.pdfDocument._transport;
+      if (!tr) return;
+      tr.pkFlatten = flattenAuto ? { subtypes: ["Stamp"], all: false } : null;
+      if (!tr.__hostSaveWrapped) {
+        // 저장 데이터가 PDF.js의 저장 처리를 거쳤는지 표시해 둔다 (거치지 않은 "원본 그대로 저장"과 구별).
+        // 저장 처리가 실패하면 PDF.js는 원본을 그대로 내려받는 쪽으로 넘어가는데, 그것을 파일에 덮어쓰면
+        // 수정한 내용이 빠진 채 "저장됨"이 되므로 실패도 표시해 둔다.
+        var orig = tr.saveDocument;
+        tr.__hostSaveWrapped = true;
+        tr.saveDocument = function () {
+          workerSaved = false;
+          saveFailed = false;
+          return orig.apply(this, arguments).then(
+            function (d) { workerSaved = true; return d; },
+            function (e) {
+              saveFailed = true;
+              setTimeout(function () { saveFailed = false; }, 3000);
+              post("log|saveDocument failed: " + (e && e.message ? e.message : e));
+              throw e;
+            });
+        };
+      }
+    } catch (e) {}
+  }
+  // 방금 끝난 저장에서 박아 넣은 결과 { done, skipped, blocked, failedPages } (한 번 읽으면 지워진다)
+  function flattenResult() {
+    try {
+      var tr = app.pdfDocument._transport;
+      return tr.messageHandler.sendWithPromise("PkFlattenResult", null).then(null, function () { return null; });
+    } catch (e) { return Promise.resolve(null); }
+  }
+  function postSave(data, name, query) {
+    var body = (typeof Blob !== "undefined" && data instanceof Blob) ? data : new Blob([data], { type: "application/pdf" });
+    return fetch("https://pdfjs.local/save/" + encodeURIComponent(name) + (query || ""), { method: "POST", body: body, cache: "no-store" })
+      .then(function (r) { return r.json(); });
+  }
+  function flattenReply(o) {
+    var s = "";
+    for (var k in o) s += k + "=" + String(o[k]).replace(/[;\r\n]/g, " ") + ";";
+    post("flattendone|" + s);
+  }
+  function doFlatten(subtypes) {
+    if (!app || !app.pdfDocument) { flattenReply({ error: "열린 문서가 없습니다" }); return; }
+    var doc = app.pdfDocument, tr = doc._transport;
+    var wasDirty = annDirty;
+    function keepDirty() { if (wasDirty) { annDirty = true; recomputeDirty(); } }
+    setFlattenDefault();
+    tr.pkFlatten = { subtypes: subtypes, all: true };
+    Promise.resolve()
+      .then(function () { return doc.saveDocument(); })
+      .then(function (data) {
+        workerSaved = false;
+        return flattenResult().then(function (res) {
+          res = res || {};
+          var info = { done: res.done | 0, skipped: res.skipped | 0, blocked: res.blocked | 0, failed: res.failedPages | 0 };
+          if (!info.done) {
+            // 박아 넣은 것이 없으면 파일을 건드리지 않는다
+            keepDirty();
+            flattenReply(info);
+            return;
+          }
+          return postSave(data, app._docFilename || "document.pdf", "").then(function (r) {
+            if (r && r.ok) {
+              markSaved();
+              flattenReply(info);
+              post("reload");
+            } else {
+              keepDirty();
+              info.error = (r && r.cancelled) ? "저장을 취소했습니다" : ((r && r.error) || "파일을 쓰지 못했습니다");
+              flattenReply(info);
+            }
+          });
+        });
+      })
+      .then(null, function (e) {
+        workerSaved = false;
+        saveFailed = false;
+        keepDirty();
+        flattenReply({ error: (e && e.message) ? e.message : String(e) });
+      })
+      .then(function () { setFlattenDefault(); });
   }
 
   // PDF.js가 띄우는 브라우저의 "변경 사항이 저장되지 않았습니다" 경고창 막기 (저장 여부는 탭을 닫을 때 프로그램이 직접 묻는다)
@@ -331,6 +423,8 @@
     else if (type === "toasterr") toast(arg, true);
     else if (type === "cancel") cancelled = true;
     else if (type === "rotate") { try { var o = JSON.parse(arg); doRotate(o.pages, o.delta); } catch (x) { toast("회전 실패: " + x, true); } }
+    else if (type === "flattenauto") { flattenAuto = arg === "1"; setFlattenDefault(); }
+    else if (type === "flatten") { try { doFlatten(JSON.parse(arg)); } catch (x) { flattenReply({ error: String(x) }); } }
     else if (type === "extract") runExport(extractImages);
     else if (type === "pages2img") { try { var po = JSON.parse(arg); runExport(function () { return pagesToImages(po); }); } catch (x) { post("exporterror|" + x); } }
     else if (type === "text") runExport(extractText);
@@ -359,21 +453,33 @@
       var useSaveAs = saveAsNext;
       var isExport = exportNext;
       var wasRotate = rotateSaveNext;
+      var viaWorker = workerSaved;
+      var failed = saveFailed;
       saveAsNext = false;
       exportNext = false;
       rotateSaveNext = false;
+      workerSaved = false;
+      saveFailed = false;
+      if (failed && !isExport) {
+        toast("저장 실패: 수정한 내용을 PDF에 넣지 못했습니다 (파일은 그대로입니다)", true);
+        post("savefailed|" + (filename || ""));
+        return;
+      }
       if (!data) { toast("저장할 데이터가 없습니다", true); return; }
-      var body = (typeof Blob !== "undefined" && data instanceof Blob) ? data : new Blob([data], { type: "application/pdf" });
       var name = filename || "document.pdf";
       if (isExport) name = "export:" + name.replace(/\.pdf$/i, "") + "_추출.pdf";
-      var target = "https://pdfjs.local/save/" + encodeURIComponent(name) + (useSaveAs || isExport ? "?saveas=1" : "");
-      return fetch(target, { method: "POST", body: body, cache: "no-store" })
-        .then(function (r) { return r.json(); })
+      return postSave(data, name, useSaveAs || isExport ? "?saveas=1" : "")
         .then(function (res) {
           if (res.ok) {
             if (!isExport) markSaved();
-            toast(wasRotate ? "회전을 저장했습니다" : "저장됨: " + res.name);
-            if (wasRotate) post("reload");
+            if (wasRotate) { toast("회전을 저장했습니다"); post("reload"); return; }
+            if (isExport || !viaWorker) { toast("저장됨: " + res.name); return; }
+            // 이번 저장에서 서명·그림을 박아 넣었으면 알려 준다
+            return flattenResult().then(function (fi) {
+              var n = fi ? (fi.done | 0) : 0;
+              toast("저장됨: " + res.name + (n ? "  (서명·그림 " + n + "개를 문서에 박아 넣음)" : ""));
+              if (fi && (fi.blocked | 0) > 0) post("flatblocked|" + (fi.blocked | 0));
+            });
           } else if (!res.cancelled) {
             toast("저장 실패: " + (res.error || ""), true);
           }
@@ -402,6 +508,7 @@
       a.eventBus.on(ev, function () { wrapStorage(); });
     });
     a.eventBus.on("documentloaded", function () {
+      setFlattenDefault();
       annDirty = false;
       savedStruct = "";
       recomputeDirty(); // 합치기 뒤 다시 불러온 문서는 _mergedDocumentNeedsSaving 때문에 수정 상태가 된다

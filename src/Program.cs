@@ -94,6 +94,7 @@ namespace PdfViewerApp
             }
 
             Util.NoRecent = selftestDir != null;
+            if (selftestDir != null) Flatten.TestOverride = true;   // 자체 시험은 사용자의 설정을 읽지도 바꾸지도 않는다
             try
             {
                 Application.Run(new MainForm(files, selftestDir, primary));
@@ -327,7 +328,20 @@ namespace PdfViewerApp
         ContextMenuStrip BuildToolsMenu()
         {
             var m = NewMenu();
+            m.ShowCheckMargin = true;   // 체크 표시가 보이려면 필요하다 (그림 여백을 꺼 두었으므로)
             m.Items.Add(MenuItemOf("페이지 회전 저장...", null, delegate { ToolRotate(); }));
+            m.Items.Add(MenuItemOf("서명·주석 박아 넣기...", null, delegate { ToolFlatten(); }));
+            var autoFlatten = new ToolStripMenuItem("저장할 때 서명·그림을 자동으로 박아 넣기");
+            autoFlatten.CheckOnClick = true;
+            autoFlatten.Checked = Flatten.OnSave;
+            autoFlatten.ToolTipText = "켜 두면 새로 넣은 서명과 그림(도장)이 저장할 때 쪽의 일부가 되어, 다른 프로그램에서 따로 집어 복사·삭제할 수 없습니다";
+            autoFlatten.CheckedChanged += delegate
+            {
+                Flatten.OnSave = autoFlatten.Checked;
+                foreach (var d in docs) d.SendFlattenSetting();
+            };
+            m.Items.Add(autoFlatten);
+            m.Items.Add(new ToolStripSeparator());
             m.Items.Add(MenuItemOf("용량 줄이기...", null, delegate { ToolCompress(); }));
             m.Items.Add(MenuItemOf("잠금(암호) 해제...", null, delegate { ToolUnlock(); }));
             m.Items.Add(new ToolStripSeparator());
@@ -344,6 +358,7 @@ namespace PdfViewerApp
         ContextMenuStrip BuildHelpMenu()
         {
             var m = NewMenu();
+            m.ShowCheckMargin = true;   // 체크 표시가 보이려면 필요하다 (이전 판에서는 켜짐·꺼짐이 보이지 않았다)
             m.Items.Add(MenuItemOf("사용법 (README)", null, delegate { OpenReadme(); }));
             var notice = new ToolStripMenuItem("시작할 때 프로젝트 공지 받기");
             notice.CheckOnClick = true;
@@ -868,6 +883,58 @@ namespace PdfViewerApp
             doc.Rotate(pages, delta);
         }
 
+        // 서명·주석 박아 넣기: 고른 종류의 주석을 쪽 내용으로 옮겨 저장한다 (문서에 이미 들어 있던 것까지).
+        // 박아 넣은 것은 쪽의 일부가 되어 다른 프로그램에서 주석처럼 따로 집어 옮기거나 복사·삭제할 수 없다.
+        async void ToolFlatten()
+        {
+            var doc = RequireDoc();
+            if (doc == null) return;
+            string info;
+            try { info = await doc.GetPageInfoAsync(); }
+            catch (Exception ex) { Error(ex.Message); return; }
+            var parts = info.Split('|');
+            if (parts.Length >= 3 && parts[2] == "1")
+            {
+                Info("페이지 삭제·순서 변경이 아직 저장되지 않았습니다.\n먼저 Ctrl+S 로 저장한 뒤 다시 해 주세요.");
+                return;
+            }
+            string kind;
+            using (var dlg = new FlattenDialog(Flatten.Kind))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                kind = dlg.Kind;
+            }
+            Flatten.Kind = kind;
+            FlattenOutcome r;
+            try { r = await doc.FlattenAsync(kind); }
+            catch (Exception ex) { Error("박아 넣지 못했습니다.\n\n" + ex.Message); return; }
+            ShowFlattenOutcome(r);
+        }
+
+        void ShowFlattenOutcome(FlattenOutcome r)
+        {
+            SelftestLog("FLATTEN outcome done=" + r.Done + " skipped=" + r.Skipped + " blocked=" + r.Blocked + " failed=" + r.Failed + " error=" + r.Error);
+            if (!string.IsNullOrEmpty(r.Error)) { Error("박아 넣지 못했습니다.\n\n" + r.Error); return; }
+            var sb = new StringBuilder();
+            if (r.Done > 0) sb.Append(r.Done + "개를 문서에 박아 넣고 저장했습니다.");
+            else if (r.Blocked > 0)
+                sb.Append("전자서명이 들어 있는 문서라서 박아 넣지 않았습니다.\n쪽 내용을 바꾸면 전자서명이 '서명 후 변경됨'으로 표시되기 때문입니다.");
+            else if (r.Skipped == 0 && r.Failed == 0) sb.Append("박아 넣을 것이 없습니다.");
+            else sb.Append("박아 넣은 것이 없습니다.");
+            if (r.Skipped > 0)
+                sb.Append("\n\n" + r.Skipped + "개는 박아 넣을 수 없어 주석으로 그대로 두었습니다.\n(모양 정보가 들어 있지 않은 주석입니다. 한글 글상자가 대표적입니다.)");
+            if (r.Failed > 0) sb.Append("\n\n" + r.Failed + "쪽은 내용을 읽지 못해 건드리지 않았습니다.");
+            Info(sb.ToString());
+        }
+
+        // 저장하면서 자동으로 박아 넣으려 했으나 전자서명이 있는 문서라 주석으로 남긴 경우
+        public void OnFlattenBlocked(DocTab doc, string count)
+        {
+            SelftestLog("FLATTEN blocked by a digital signature: " + count);
+            Info("이 문서에는 전자서명이 들어 있어서, 새로 넣은 서명·그림을 박아 넣지 않고 주석으로 저장했습니다.\n\n" +
+                 "쪽 내용을 바꾸면 전자서명이 '서명 후 변경됨'으로 표시되기 때문입니다.");
+        }
+
         async void ToolCompress()
         {
             var doc = RequireDoc();
@@ -1368,9 +1435,19 @@ namespace PdfViewerApp
                     SelftestCaptureDialog(d, "dlg_img2pdf.png");
                 using (var d = new ImagesToPdfDialog(new List<string> { @"C:\그림\그래프.png" })) SelftestCaptureDialog(d, "dlg_img2pdf_single.png");
                 using (var d = new ProgressForm("PDF로 변환", "3 / 20   영수증 3.jpg", true)) SelftestCaptureDialog(d, "dlg_progress.png");
+                using (var d = new FlattenDialog("sign"))
+                {
+                    d.TestChoose("draw");
+                    SelftestLog("DIALOG flatten draw → " + d.Kind);
+                    if (d.Kind != "draw") ok = false;
+                }
+                using (var d = new FlattenDialog("sign")) SelftestCaptureDialog(d, "dlg_flatten.png");
+                SelftestCaptureMenu(BuildToolsMenu(), "menu_tools.png");
+                SelftestCaptureMenu(BuildHelpMenu(), "menu_help.png");
             }
             catch (Exception ex) { SelftestLog("DIALOG check FAILED " + ex.Message); ok = false; }
 
+            if (!await SelftestFlatten(doc)) ok = false;
             if (!await SelftestImagesToPdf(doc)) ok = false;
 
             SelftestLog("TOOLS " + (ok ? "OK" : "FAIL"));
@@ -1400,6 +1477,424 @@ namespace PdfViewerApp
                 SelftestLog("CAPTURED " + name + " size=" + dlg.Width + "x" + dlg.Height);
             }
             catch (Exception ex) { SelftestLog("dialog capture failed: " + name + " " + ex.Message); }
+        }
+
+        // 메뉴를 화면 밖에 잠깐 펼쳐 그림으로 남긴다 (체크 표시·글자 배치 확인용)
+        void SelftestCaptureMenu(ContextMenuStrip menu, string name)
+        {
+            try
+            {
+                using (menu)
+                {
+                    menu.Show(new Point(-6000, -6000));
+                    using (var bmp = new Bitmap(menu.Width, menu.Height))
+                    {
+                        menu.DrawToBitmap(bmp, new Rectangle(0, 0, bmp.Width, bmp.Height));
+                        bmp.Save(Path.Combine(SelftestDir, name), System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                    SelftestLog("CAPTURED " + name + " size=" + menu.Width + "x" + menu.Height);
+                    menu.Close();
+                }
+            }
+            catch (Exception ex) { SelftestLog("menu capture failed: " + name + " " + ex.Message); }
+        }
+
+        // ---------- 자체 시험: 서명·주석 박아 넣기 ----------
+
+        // 1쪽에 서명(빨간 사각 윤곽 100×40)과 그림(파란 사각형, 두 배로 키워 놓음)을 "방금 넣은 것"으로 심는다.
+        // 뷰어의 편집기를 거치지 않고 PDF.js의 저장 처리가 받는 형식 그대로 넣으므로, 저장하면 진짜 서명·그림과 같은 길로 파일에 들어간다.
+        const string FlattenSeedJs = @"
+(async function () {
+  try {
+    var st = window.PDFViewerApplication.pdfDocument.annotationStorage;
+    var T = globalThis.pdfjsLib.AnnotationEditorType;
+    var dy = window.__pkSeedShift || 0;   // 같은 문서에 두 번째로 심을 때는 아래로 옮겨서
+    var x = 100, y = 500 - dy, w = 100, h = 40, N = NaN;
+    st.setValue('pdfjs_internal_editor_9001', {
+      annotationType: T.SIGNATURE, isSignature: true, areContours: true, color: [255, 0, 0], thickness: 0,
+      pageIndex: 0, rect: [x, y, x + w, y + h], rotation: 0, structTreeParentId: null,
+      lines: [[N, N, N, N, x, y, N, N, N, N, x + w, y, N, N, N, N, x + w, y + h, N, N, N, N, x, y + h]],
+      accessibilityData: { type: 'Figure', alt: 'test signature' }
+    });
+    var c = new OffscreenCanvas(60, 30), g = c.getContext('2d');
+    g.fillStyle = '#0000ff'; g.fillRect(0, 0, 60, 30);
+    st.setValue('pdfjs_internal_editor_9002', {
+      annotationType: T.STAMP, bitmapId: 'image_test_9002', bitmap: c.transferToImageBitmap(), pageIndex: 0,
+      rect: [300, 500 - dy, 420, 560 - dy], rotation: 0, isSvg: false, structTreeParentId: null
+    });
+    chrome.webview.postMessage('testresult|seeded=' + st.size);
+  } catch (e) { chrome.webview.postMessage('testresult|error:' + e); }
+})();";
+
+        // 주석으로 저장돼 있는 서명(빨간 사각형)을 100pt 아래로 옮긴 "편집"을 심는다 (뷰어에서 기존 서명을 끌어 옮긴 것과 같은 형식)
+        const string FlattenMoveJs = @"
+(async function () {
+  try {
+    var doc = window.PDFViewerApplication.pdfDocument, st = doc.annotationStorage;
+    var T = globalThis.pdfjsLib.AnnotationEditorType;
+    var page = await doc.getPage(1), anns = await page.getAnnotations(), target = null;
+    anns.forEach(function (a) { if (a.subtype === 'Stamp' && Math.abs(a.rect[0] - 100) < 1) target = a; });
+    if (!target) throw new Error('the saved signature annotation was not found');
+    st.setValue('pdfjs_internal_editor_9003', {
+      annotationType: T.STAMP, id: target.id, pageIndex: 0, rect: [100, 400, 200, 440], rotation: 0, isSvg: false, structTreeParentId: null
+    });
+    chrome.webview.postMessage('testresult|moved=' + target.id);
+  } catch (e) { chrome.webview.postMessage('testresult|error:' + e); }
+})();";
+
+        // 1쪽을 주석 없이(쪽 내용만) 그렸을 때와 주석까지 그렸을 때 서명·그림 자리의 색, 남아 있는 주석 종류, 쪽 회전
+        const string FlattenProbeJs = @"
+(async function () {
+  try {
+    var page = await window.PDFViewerApplication.pdfDocument.getPage(1);
+    var anns = await page.getAnnotations();
+    var kinds = anns.map(function (a) { return a.subtype; }).sort().join('+');
+    var vp = page.getViewport({ scale: 1 });
+    async function colors(mode) {
+      var c = document.createElement('canvas');
+      c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+      var ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, c.width, c.height);
+      await page.render({ canvasContext: ctx, viewport: vp, annotationMode: mode }).promise;
+      function at(px, py) {
+        var p = vp.convertToViewportPoint(px, py);
+        var d = ctx.getImageData(Math.floor(p[0]), Math.floor(p[1]), 1, 1).data;
+        return [d[0], d[1], d[2]].map(function (v) { return ('0' + v.toString(16)).slice(-2); }).join('');
+      }
+      return [at(150, 520), at(360, 530), at(150, 420)];
+    }
+    var plain = await colors(0), full = await colors(1);
+    chrome.webview.postMessage('testresult|annots=' + kinds + ';sig=' + plain[0] + ';img=' + plain[1] + ';sig2=' + plain[2] +
+      ';sigA=' + full[0] + ';imgA=' + full[1] + ';rot=' + page.rotate);
+  } catch (e) { chrome.webview.postMessage('testresult|error:' + e); }
+})();";
+
+        static string ProbeField(string s, string key)
+        {
+            foreach (string part in (s ?? "").Split(';'))
+                if (part.StartsWith(key + "=", StringComparison.Ordinal)) return part.Substring(key.Length + 1);
+            return "";
+        }
+
+        static bool ColorNear(string hex, int r, int g, int b, int tol)
+        {
+            if (hex == null || hex.Length != 6) return false;
+            int hr = Convert.ToInt32(hex.Substring(0, 2), 16), hg = Convert.ToInt32(hex.Substring(2, 2), 16), hb = Convert.ToInt32(hex.Substring(4, 2), 16);
+            return Math.Abs(hr - r) <= tol && Math.Abs(hg - g) <= tol && Math.Abs(hb - b) <= tol;
+        }
+
+        static int StampCount(string probe)
+        {
+            return ProbeField(probe, "annots").Split('+').Count(k => k == "Stamp");
+        }
+
+        // 서명·그림이 주석이 아니라 쪽 내용으로 그려지는가
+        static bool FlattenBaked(string probe)
+        {
+            return StampCount(probe) == 0 && ColorNear(ProbeField(probe, "sig"), 255, 0, 0, 8) && ColorNear(ProbeField(probe, "img"), 0, 0, 255, 16);
+        }
+
+        // 서명·그림이 주석으로 남아 있는가 (쪽 내용에는 없고, 주석까지 그리면 보인다)
+        static bool FlattenStillAnnotations(string probe)
+        {
+            return StampCount(probe) == 2 &&
+                   !ColorNear(ProbeField(probe, "sig"), 255, 0, 0, 8) && !ColorNear(ProbeField(probe, "img"), 0, 0, 255, 16) &&
+                   ColorNear(ProbeField(probe, "sigA"), 255, 0, 0, 8) && ColorNear(ProbeField(probe, "imgA"), 0, 0, 255, 16);
+        }
+
+        async Task<DocTab> FlattenTestTab(string source, string target)
+        {
+            File.Copy(source, target, true);
+            var tab = await NewTab(target);
+            await WithTimeout(ExpectReady(tab), 30000);
+            await Task.Delay(500);
+            return tab;
+        }
+
+        // 다음 "준비됨" 신호를 기다릴 작업. 신호를 일으키는 일을 하기 전에 받아 두어야 한다 (신호가 오면 칸이 비워지므로)
+        static Task<bool> ExpectReady(DocTab tab)
+        {
+            var tcs = new TaskCompletionSource<bool>();
+            tab.ReadyTcs = tcs;
+            return tcs.Task;
+        }
+
+        static Task<string> ExpectSaved(DocTab tab)
+        {
+            var tcs = new TaskCompletionSource<string>();
+            tab.SavedTcs = tcs;
+            return tcs.Task;
+        }
+
+        async Task FlattenSaveAndReload(DocTab tab)
+        {
+            Task<string> saved = ExpectSaved(tab);
+            tab.RequestSave();
+            await WithTimeout(saved, 30000);
+            await Task.Delay(300);
+            Task<bool> ready = ExpectReady(tab);
+            tab.NavigateTo(tab.DocPath);
+            await WithTimeout(ready, 30000);
+            await Task.Delay(500);
+        }
+
+        async Task<string> FlattenProbeAfter(DocTab tab, Task<bool> ready)
+        {
+            await WithTimeout(ready, 30000);
+            await Task.Delay(500);
+            return await tab.EvalTestAsync(FlattenProbeJs);
+        }
+
+        async Task<bool> SelftestFlatten(DocTab back)
+        {
+            bool ok = true;
+            string dir = Path.Combine(SelftestDir, "flatten");
+            DocTab tab = null;
+            try
+            {
+                Directory.CreateDirectory(dir);
+                string source = back.DocPath;
+
+                // (가) 자동: 저장만 해도 서명·그림이 쪽 내용이 된다
+                Flatten.TestOverride = true;
+                tab = await FlattenTestTab(source, Path.Combine(dir, "auto.pdf"));
+                string seeded = await tab.EvalTestAsync(FlattenSeedJs);
+                await FlattenSaveAndReload(tab);
+                string auto = await tab.EvalTestAsync(FlattenProbeJs);
+                SelftestLog("TOOL flatten auto → " + seeded + " → " + auto);
+                if (!FlattenBaked(auto)) ok = false;
+                int baseRotate;
+                int.TryParse(ProbeField(auto, "rot"), out baseRotate);
+                RemoveTab(tab);
+
+                // (나) 자동을 끄면 주석으로 남고, 도구로 박아 넣으면 쪽 내용이 된다. 한 번 더 하면 할 것이 없고 파일도 그대로다
+                Flatten.TestOverride = false;
+                tab = await FlattenTestTab(source, Path.Combine(dir, "tool.pdf"));
+                await tab.EvalTestAsync(FlattenSeedJs);
+                await FlattenSaveAndReload(tab);
+                string before = await tab.EvalTestAsync(FlattenProbeJs);
+                SelftestLog("TOOL flatten off → " + before);
+                if (!FlattenStillAnnotations(before)) ok = false;
+                Task<bool> reloaded = ExpectReady(tab);
+                FlattenOutcome first = await tab.FlattenAsync("sign");
+                string after = first.Done > 0 ? await FlattenProbeAfter(tab, reloaded) : "(not reloaded)";
+                SelftestLog("TOOL flatten tool → done=" + first.Done + " skipped=" + first.Skipped + " error=" + first.Error + " → " + after);
+                if (first.Done != 2 || !FlattenBaked(after)) ok = false;
+                long len = new FileInfo(tab.DocPath).Length;
+                DateTime stamp = File.GetLastWriteTimeUtc(tab.DocPath);
+                FlattenOutcome second = await tab.FlattenAsync("all");
+                bool untouched = new FileInfo(tab.DocPath).Length == len && File.GetLastWriteTimeUtc(tab.DocPath) == stamp;
+                SelftestLog("TOOL flatten again → done=" + second.Done + " skipped=" + second.Skipped + " file untouched=" + untouched);
+                if (second.Done != 0 || !untouched) ok = false;
+                RemoveTab(tab);
+
+                // (라) 주석으로 저장돼 있던 서명을 옮겨서 저장하면 그 서명이 새 자리에 박힌다. 건드리지 않은 그림은 주석으로 남는다
+                Flatten.TestOverride = false;
+                tab = await FlattenTestTab(source, Path.Combine(dir, "moved.pdf"));
+                await tab.EvalTestAsync(FlattenSeedJs);
+                await FlattenSaveAndReload(tab);
+                Flatten.TestOverride = true;
+                tab.SendFlattenSetting();
+                string movedId = await tab.EvalTestAsync(FlattenMoveJs);
+                await FlattenSaveAndReload(tab);
+                string moved = await tab.EvalTestAsync(FlattenProbeJs);
+                SelftestLog("TOOL flatten moved → " + movedId + " → " + moved);
+                if (StampCount(moved) != 1 || ColorNear(ProbeField(moved, "sig"), 255, 0, 0, 8) || !ColorNear(ProbeField(moved, "sig2"), 255, 0, 0, 8) ||
+                    ColorNear(ProbeField(moved, "img"), 0, 0, 255, 16) || !ColorNear(ProbeField(moved, "imgA"), 0, 0, 255, 16)) ok = false;
+                RemoveTab(tab);
+
+                // (다) 회전 저장과 함께: 새로 넣은 서명·그림이 사라지지 않고, 켜져 있으면 박힌다
+                Flatten.TestOverride = false;
+                tab = await FlattenTestTab(source, Path.Combine(dir, "rotate_keep.pdf"));
+                await tab.EvalTestAsync(FlattenSeedJs);
+                reloaded = ExpectReady(tab);
+                tab.Rotate(new List<int> { 1 }, 90);
+                string kept = await FlattenProbeAfter(tab, reloaded);
+                SelftestLog("TOOL flatten rotate (off) → " + kept);
+                if (!FlattenStillAnnotations(kept) || ProbeField(kept, "rot") != ((baseRotate + 90) % 360).ToString()) ok = false;
+                RemoveTab(tab);
+
+                Flatten.TestOverride = true;
+                tab = await FlattenTestTab(source, Path.Combine(dir, "rotate_bake.pdf"));
+                await tab.EvalTestAsync(FlattenSeedJs);
+                reloaded = ExpectReady(tab);
+                tab.Rotate(new List<int> { 1 }, 90);
+                string baked = await FlattenProbeAfter(tab, reloaded);
+                SelftestLog("TOOL flatten rotate (on) → " + baked);
+                if (!FlattenBaked(baked) || ProbeField(baked, "rot") != ((baseRotate + 90) % 360).ToString()) ok = false;
+                RemoveTab(tab);
+                tab = null;
+
+                // (마) 수정한 내용을 PDF로 만들지 못하면 파일을 건드리지 않고 실패를 알린다
+                //      (예전에는 수정이 빠진 원본을 그대로 덮어쓰고 "저장됨"이라고 했다)
+                tab = await FlattenTestTab(source, Path.Combine(dir, "fail.pdf"));
+                byte[] untouchedBytes = File.ReadAllBytes(tab.DocPath);
+                var failed = new TaskCompletionSource<string>();
+                tab.SaveFailedTcs = failed;
+                await tab.EvalTestAsync(@"
+(function () {
+  var st = window.PDFViewerApplication.pdfDocument.annotationStorage, T = globalThis.pdfjsLib.AnnotationEditorType;
+  st.setValue('pdfjs_internal_editor_9009', { annotationType: T.STAMP, pageIndex: 0, rect: [100, 100, 200, 150], rotation: 0, isSvg: false });
+  chrome.webview.postMessage('testresult|broken seed');
+})();");
+                tab.RequestSave();
+                string failName = await WithTimeout(failed.Task, 20000);
+                await Task.Delay(300);
+                bool same = File.ReadAllBytes(tab.DocPath).SequenceEqual(untouchedBytes);
+                SelftestLog("TOOL save failure → reported for '" + failName + "', file untouched=" + same);
+                if (!same) ok = false;
+                RemoveTab(tab);
+                tab = null;
+
+                if (!await SelftestSignatureTool(source, dir)) ok = false;
+                if (!await SelftestFlattenExtra()) ok = false;
+            }
+            catch (Exception ex)
+            {
+                SelftestLog("TOOL flatten FAILED " + ex.Message);
+                ok = false;
+                try { if (tab != null && docs.Contains(tab)) RemoveTab(tab); } catch { }
+            }
+            finally
+            {
+                Flatten.TestOverride = true;
+                if (back != null && docs.Contains(back)) SelectTab(back);
+            }
+            return ok;
+        }
+
+        // 뷰어의 서명 도구를 실제로 거친다: 서명 모드로 바꾸고 "서명 추가" 창에서 이름을 입력해 서명을 만든다.
+        // 사용자가 저장해 둔 서명 목록(브라우저 저장소)은 건드리지 않는다: "저장해 두기"를 끄고, 끝나면 목록을 원래대로 되돌린다.
+        const string SignatureAddJs = @"
+(async function () {
+  var KEY = 'pdfjs.signature', kept = null, out = '';
+  try { kept = localStorage.getItem(KEY); } catch (e) {}
+  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  async function until(fn, ms) { var t = Date.now(); while (Date.now() - t < ms) { if (fn()) return true; await wait(50); } return false; }
+  try {
+    var app = window.PDFViewerApplication, st = app.pdfDocument.annotationStorage;
+    var T = globalThis.pdfjsLib.AnnotationEditorType;
+    app.eventBus.dispatch('switchannotationeditormode', { source: app, mode: T.SIGNATURE });
+    await wait(400);
+    var dlg = document.getElementById('addSignatureDialog');
+    if (!dlg.open) document.getElementById('editorSignatureAddSignature').click();
+    if (!(await until(function () { return dlg.open; }, 6000))) throw new Error('the add-signature dialog did not open');
+    await wait(200);
+    document.getElementById('addSignatureSaveCheckbox').checked = false;
+    var inp = document.getElementById('addSignatureTypeInput');
+    inp.value = 'Taehee Kim';
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(300);
+    document.getElementById('addSignatureAddButton').click();
+    if (!(await until(function () { return !dlg.open && st.size > 0; }, 6000))) throw new Error('no signature was added');
+    await wait(400);
+    var rect = null, type = null, page = 0;
+    st.serializable.map.forEach(function (v) { if (v && v.isSignature) { rect = v.rect; type = v.annotationType; page = v.pageIndex + 1; } });
+    out = 'added=' + st.size + ';type=' + (type === T.SIGNATURE ? 'signature' : type) + ';page=' + page +
+      ';rect=' + (rect ? rect.map(function (v) { return Math.round(v * 100) / 100; }).join(',') : '');
+  } catch (e) { out = 'error:' + e; }
+  try { if (kept === null) localStorage.removeItem(KEY); else localStorage.setItem(KEY, kept); } catch (e) {}
+  chrome.webview.postMessage('testresult|' + out);
+})();";
+
+        // 주어진 사각형(쪽 좌표) 안의 어두운 화소 수: 주석은 그리지 않고 쪽 내용만 그려서 센다
+        static string SignatureInkJs(string page, string rect)
+        {
+            return @"
+(async function () {
+  try {
+    var page = await window.PDFViewerApplication.pdfDocument.getPage(" + page + @");
+    var anns = await page.getAnnotations();
+    var vp = page.getViewport({ scale: 2 });
+    var c = document.createElement('canvas');
+    c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+    var ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, c.width, c.height);
+    await page.render({ canvasContext: ctx, viewport: vp, annotationMode: 0 }).promise;
+    var r = [" + rect + @"];
+    var a = vp.convertToViewportPoint(r[0], r[1]), b = vp.convertToViewportPoint(r[2], r[3]);
+    var x0 = Math.floor(Math.min(a[0], b[0])), y0 = Math.floor(Math.min(a[1], b[1]));
+    var w = Math.max(1, Math.ceil(Math.abs(a[0] - b[0]))), h = Math.max(1, Math.ceil(Math.abs(a[1] - b[1])));
+    var d = ctx.getImageData(x0, y0, w, h).data, dark = 0;
+    for (var i = 0; i < d.length; i += 4) if (d[i] + d[i + 1] + d[i + 2] < 300) dark++;
+    chrome.webview.postMessage('testresult|dark=' + dark + ';box=' + w + 'x' + h + ';annots=' + anns.map(function (x) { return x.subtype; }).sort().join('+'));
+  } catch (e) { chrome.webview.postMessage('testresult|error:' + e); }
+})();";
+        }
+
+        async Task<bool> SelftestSignatureTool(string source, string dir)
+        {
+            Flatten.TestOverride = true;
+            DocTab tab = null;
+            try
+            {
+                tab = await FlattenTestTab(source, Path.Combine(dir, "signature.pdf"));
+                string added = await tab.EvalTestAsync(SignatureAddJs);
+                string rect = ProbeField(added, "rect"), page = ProbeField(added, "page");
+                if (added.StartsWith("error", StringComparison.Ordinal) || rect.Length == 0)
+                {
+                    SelftestLog("TOOL signature tool FAILED " + added);
+                    return false;
+                }
+                string before = await tab.EvalTestAsync(SignatureInkJs(page, rect));
+                await FlattenSaveAndReload(tab);
+                string after = await tab.EvalTestAsync(SignatureInkJs(page, rect));
+                int dark0, dark1;
+                int.TryParse(ProbeField(before, "dark"), out dark0);
+                int.TryParse(ProbeField(after, "dark"), out dark1);
+                bool baked = dark1 > dark0 + 40 && ProbeField(after, "annots").IndexOf("Stamp", StringComparison.Ordinal) < 0;
+                SelftestLog("TOOL signature tool → " + added + " → before " + before + " → saved " + after + (baked ? "" : "  NOT BAKED"));
+                return baked;
+            }
+            catch (Exception ex)
+            {
+                SelftestLog("TOOL signature tool FAILED " + ex.Message);
+                return false;
+            }
+            finally
+            {
+                try { if (tab != null && docs.Contains(tab)) RemoveTab(tab); } catch { }
+            }
+        }
+
+        // 결과폴더\extra-flatten 에 PDF들을 넣어 두면, 하나씩 열어 주석을 전부 박아 넣는다(파일 자체를 고친다; 비교용 원본은 따로 둘 것).
+        // 이름이 seed_ 로 시작하는 파일에는 먼저 시험용 서명·그림을 주석으로 저장해 <이름>.annotated.pdf 로 남긴 뒤 박아 넣는다.
+        async Task<bool> SelftestFlattenExtra()
+        {
+            string extra = Path.Combine(SelftestDir, "extra-flatten");
+            if (!Directory.Exists(extra)) return true;
+            bool ok = true;
+            foreach (string pdf in Directory.GetFiles(extra, "*.pdf").Where(f => !f.EndsWith(".annotated.pdf", StringComparison.OrdinalIgnoreCase)).OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
+            {
+                DocTab tab = null;
+                string name = Path.GetFileName(pdf);
+                try
+                {
+                    bool seed = name.StartsWith("seed_", StringComparison.OrdinalIgnoreCase);
+                    Flatten.TestOverride = false;
+                    tab = await NewTab(pdf);
+                    await WithTimeout(ExpectReady(tab), 30000);
+                    await Task.Delay(400);
+                    if (seed)
+                    {
+                        // 이미 한 번 박아 넣은 문서(이름에 twice)에는 자리를 옮겨 한 번 더 심는다
+                        if (name.IndexOf("twice", StringComparison.OrdinalIgnoreCase) >= 0)
+                            await tab.Core.ExecuteScriptAsync("window.__pkSeedShift = 120;");
+                        await tab.EvalTestAsync(FlattenSeedJs);
+                        await FlattenSaveAndReload(tab);
+                        File.Copy(pdf, Path.ChangeExtension(pdf, null) + ".annotated.pdf", true);
+                    }
+                    Task<bool> reloaded = ExpectReady(tab);
+                    FlattenOutcome r = await tab.FlattenAsync("all");
+                    if (r.Done > 0) { await WithTimeout(reloaded, 30000); await Task.Delay(300); }
+                    SelftestLog("FLATTEN extra " + name + " → done=" + r.Done + " skipped=" + r.Skipped + " blocked=" + r.Blocked + " failed=" + r.Failed + " error=" + r.Error);
+                    if (!string.IsNullOrEmpty(r.Error)) ok = false;
+                }
+                catch (Exception ex) { SelftestLog("FLATTEN extra " + name + " FAILED " + ex.Message); ok = false; }
+                finally { try { if (tab != null && docs.Contains(tab)) RemoveTab(tab); } catch { } }
+            }
+            Flatten.TestOverride = true;
+            return ok;
         }
 
         // ---------- 자체 시험: 그림 → PDF ----------
@@ -2027,6 +2522,16 @@ namespace PdfViewerApp
     class MenuRenderer : ToolStripProfessionalRenderer
     {
         public MenuRenderer() : base(new MenuColors()) { RoundedEdges = false; }
+
+        // 기본 체크 그림(16픽셀)은 화면 배율을 따라 커지지 않아 175%에서는 글자에 비해 너무 작다 → 글자 크기에 맞는 체크를 직접 그린다
+        protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
+        {
+            var item = e.Item;
+            var bounds = new Rectangle(0, 0, e.ImageRectangle.Right + 4, item.Height);
+            TextRenderer.DrawText(e.Graphics, "✓", item.Font, bounds,
+                item.Enabled ? Color.FromArgb(0x1B, 0x4E, 0x91) : SystemColors.GrayText,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        }
     }
 
     class MenuColors : ProfessionalColorTable
@@ -2099,6 +2604,9 @@ namespace PdfViewerApp
         public TaskCompletionSource<int> ExportTcs;
         public TaskCompletionSource<bool> ReadyTcs;
         public TaskCompletionSource<string> TestResultTcs;
+        public TaskCompletionSource<string> FlattenTcs;
+        public TaskCompletionSource<string> SavedTcs;   // 자체 시험: 다음 저장이 끝나면 저장된 경로로 끝난다
+        public TaskCompletionSource<string> SaveFailedTcs;   // 자체 시험: 뷰어가 저장 실패를 알려 오면 끝난다
 
         public DocTab(MainForm form)
         {
@@ -2239,6 +2747,24 @@ namespace PdfViewerApp
             for (int i = 0; i < pages.Count; i++) { if (i > 0) sb.Append(','); sb.Append(pages[i]); }
             sb.Append("],\"delta\":").Append(delta).Append('}');
             PostCommand("rotate|" + sb);
+        }
+
+        // 박아 넣기 도구: 뷰어가 저장하면서 고른 종류의 주석을 쪽 내용으로 옮긴다.
+        // 끝나면 "flattendone|done=3;skipped=0;blocked=0;failed=0;" 이 오고, 박아 넣은 것이 있으면 뷰어가 다시 불러오기를 청한다.
+        public async Task<FlattenOutcome> FlattenAsync(string kind)
+        {
+            if (Core == null) throw new Exception("뷰어가 준비되지 않았습니다");
+            var tcs = new TaskCompletionSource<string>();
+            FlattenTcs = tcs;
+            PostCommand("flatten|" + Flatten.SubtypesJson(kind));
+            string reply = await MainForm.WithTimeout(tcs.Task, 180000);
+            return FlattenOutcome.Parse(reply);
+        }
+
+        // 저장할 때 서명·그림을 자동으로 박아 넣을지를 뷰어에 알린다
+        public void SendFlattenSetting()
+        {
+            PostCommand("flattenauto|" + (Flatten.OnSave ? "1" : "0"));
         }
 
         // "현재쪽|전체쪽|구조변경여부(0/1)"
@@ -2550,6 +3076,8 @@ namespace PdfViewerApp
                 Form.BeginInvoke((Action)delegate { Form.RemoveTab(this); });
             }
             if (Form.SelftestDir != null && !Passive) selftestSavedPath = target;
+            var saved = SavedTcs;
+            if (saved != null) { SavedTcs = null; saved.TrySetResult(target); }
             return Util.JsonResult(true, target, null, false);
         }
 
@@ -2613,6 +3141,26 @@ namespace PdfViewerApp
                 case "reload":
                     if (!string.IsNullOrEmpty(DocPath)) NavigateTo(DocPath);
                     break;
+                case "flattendone":
+                    {
+                        var t = FlattenTcs;
+                        if (t != null) { FlattenTcs = null; t.TrySetResult(arg); }
+                        break;
+                    }
+                case "flatblocked":
+                    Form.OnFlattenBlocked(this, arg);
+                    break;
+                case "savefailed":
+                    // 뷰어가 수정 내용을 PDF로 만들지 못해 저장을 그만둔 경우: "저장하고 닫기"를 기다리던 것을 푼다
+                    Program.Log("save failed in the viewer: " + arg);
+                    Form.SelftestLog("SAVE FAILED in viewer: " + arg);
+                    CloseAfterSave = false;
+                    Form.CancelClosing();
+                    {
+                        var t = SaveFailedTcs;
+                        if (t != null) { SaveFailedTcs = null; t.TrySetResult(arg); }
+                    }
+                    break;
                 case "progress":
                     {
                         int bar = arg.IndexOf('|');
@@ -2644,6 +3192,7 @@ namespace PdfViewerApp
                     break;
                 case "ready":
                     {
+                        SendFlattenSetting();
                         var r = ReadyTcs;
                         if (r != null) { ReadyTcs = null; r.TrySetResult(true); }
                         if (Form.SelftestDir != null && !string.IsNullOrEmpty(DocPath))
@@ -2872,6 +3421,61 @@ namespace PdfViewerApp
                 }
                 catch (Exception ex) { Program.Log("settings: " + ex.Message); }
             }
+        }
+    }
+
+    // 서명·주석 박아 넣기 설정
+    static class Flatten
+    {
+        public static bool? TestOverride;   // 자체 시험용: 값이 있으면 설정 파일 대신 이것을 쓴다
+
+        // 저장할 때 새로 넣은 서명·그림(도장)을 자동으로 박아 넣을지 (기본: 켬)
+        public static bool OnSave
+        {
+            get { return TestOverride.HasValue ? TestOverride.Value : Settings.Get("flatten_on_save", "1") != "0"; }
+            set { if (TestOverride.HasValue) TestOverride = value; else Settings.Set("flatten_on_save", value ? "1" : "0"); }
+        }
+
+        // 도구에서 마지막으로 고른 범위: sign(서명·그림) | draw(+손으로 그린 것) | all(+형광펜·밑줄·도형·글상자)
+        public static string Kind
+        {
+            get { string k = Settings.Get("flatten_kind", "sign"); return (k == "draw" || k == "all") ? k : "sign"; }
+            set { Settings.Set("flatten_kind", value); }
+        }
+
+        // PDF 주석 종류 이름의 목록 (뷰어에 넘기는 JSON 배열). 메모 쪽지(Text)·링크·양식 칸은 어떤 경우에도 넣지 않는다.
+        public static string SubtypesJson(string kind)
+        {
+            if (kind == "all")
+                return "[\"Stamp\",\"Ink\",\"FreeText\",\"Highlight\",\"Underline\",\"StrikeOut\",\"Squiggly\",\"Line\",\"Square\",\"Circle\",\"Polygon\",\"PolyLine\",\"Caret\"]";
+            if (kind == "draw") return "[\"Stamp\",\"Ink\"]";
+            return "[\"Stamp\"]";
+        }
+    }
+
+    // 박아 넣기 결과: 뷰어가 "done=3;skipped=1;blocked=0;failed=0;error=...;" 꼴로 알려 준다
+    class FlattenOutcome
+    {
+        public int Done, Skipped, Blocked, Failed;
+        public string Error;
+
+        public static FlattenOutcome Parse(string s)
+        {
+            var r = new FlattenOutcome();
+            foreach (string part in (s ?? "").Split(';'))
+            {
+                int i = part.IndexOf('=');
+                if (i <= 0) continue;
+                string k = part.Substring(0, i), v = part.Substring(i + 1);
+                int n;
+                int.TryParse(v, out n);
+                if (k == "done") r.Done = n;
+                else if (k == "skipped") r.Skipped = n;
+                else if (k == "blocked") r.Blocked = n;
+                else if (k == "failed") r.Failed = n;
+                else if (k == "error") r.Error = v;
+            }
+            return r;
         }
     }
 
@@ -3335,6 +3939,28 @@ namespace PdfViewerApp
 
         public string Preset { get { return screen.Checked ? "/screen" : (printer.Checked ? "/printer" : "/ebook"); } }
         public bool Overwrite { get { return overwrite.Checked; } }
+    }
+
+    class FlattenDialog : DialogBase
+    {
+        readonly RadioButton sign, draw, all;
+
+        public FlattenDialog(string kind) : base("서명·주석 박아 넣기", 440, 240)
+        {
+            AddLabel("박아 넣을 것", 16, 12, 200, 20);
+            sign = AddRadio("서명과 그림(도장)", 24, 34, 390, kind != "draw" && kind != "all");
+            draw = AddRadio("서명·그림과 손으로 그린 것(그리기 도구)", 24, 60, 390, kind == "draw");
+            all = AddRadio("형광펜·밑줄·도형·글상자까지 (메모 쪽지는 제외)", 24, 86, 390, kind == "all");
+            AddLabel("박아 넣은 것은 쪽의 일부가 됩니다. 다른 프로그램에서 따로 집어" + Environment.NewLine +
+                     "옮기거나 복사·삭제할 수 없고, 이 뷰어에서도 다시 고칠 수 없습니다." + Environment.NewLine +
+                     "지금 문서에 바로 저장하며, 저장 전의 파일은 자동으로 백업됩니다.", 16, 122, 408, 58);
+        }
+
+        public string Kind { get { return all.Checked ? "all" : (draw.Checked ? "draw" : "sign"); } }
+        public void TestChoose(string kind)   // 자체 시험용
+        {
+            if (kind == "all") all.Checked = true; else if (kind == "draw") draw.Checked = true; else sign.Checked = true;
+        }
     }
 
     class PagesToImagesDialog : DialogBase

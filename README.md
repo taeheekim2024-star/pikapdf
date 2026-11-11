@@ -14,6 +14,7 @@ Firefox의 PDF 엔진(PDF.js)을 Windows 내장 WebView2 창에 올린 단독 �
 |---|---|
 | 보기 | 탭 여러 개, 검색, 목차·썸네일, 두 쪽 보기, 프레젠테이션, 한글 PDF 완벽 지원 |
 | 주석 | 형광펜(여러 색), 자유 그리기, 텍스트 메모, 이미지 넣기, 서명, 댓글, 양식 입력 |
+| 서명 박아 넣기 | 서명과 넣은 그림(도장)은 저장할 때 쪽 내용으로 들어가, 다른 프로그램에서 주석처럼 따로 집어 복사·삭제할 수 없음. 이미 저장된 서명·주석도 도구 메뉴에서 박아 넣기 |
 | 저장 | Ctrl+S로 원본에 바로 저장(직전 원본은 자동 백업), 다른 이름으로 저장, 인쇄 |
 | 페이지 | 삭제·잘라내기·복사·추출·순서 바꾸기, 다른 PDF나 이미지 합치기, 회전 저장(주석 유지) |
 | 도구 | 용량 줄이기·잠금 해제(Ghostscript), 이미지 추출, PDF→이미지/텍스트/Word, 오피스·한글 문서→PDF |
@@ -55,7 +56,7 @@ src/ImagePdf.cs     그림 → PDF: 작은 PDF 쓰기 코드. JPEG는 그대로(
 src/ShellConvert.cs 탐색기 우클릭·명령줄 변환(--img2pdf …): 파일마다 따로 뜬 프로세스들이 파이프로 모여 한 번에 처리
 inject.js           PDF.js 뷰어에 주입되는 스크립트: 저장 가로채기, 수정 감지, 단축키, 이미지·텍스트 내보내기
 start/              빈 탭의 시작 화면 (최근 문서, 공지)
-src/patch_pdfjs.py  pdf.js 증분 저장에 "페이지 회전" 변경을 끼워 넣는 패치
+src/patch_pdfjs.py  pdf.js 증분 저장에 "페이지 회전"과 "서명·주석 박아 넣기"(주석의 모양을 쪽 내용으로 옮김)를 끼워 넣는 패치
 docs/               GitHub Pages 소개 페이지와 notice.json
 ```
 
@@ -81,7 +82,8 @@ docs/               GitHub Pages 소개 페이지와 notice.json
 
 PikaPDF is a small, fast PDF viewer and annotator for Windows: tabs, highlights, notes, signatures,
 page organizing (delete/extract/reorder/merge/rotate), compression and unlocking (via
-Ghostscript), image/text/Word export, images-to-PDF (JPEG embedded without recompression, also from
+Ghostscript), baking signatures and stamps into the page content on save (so they cannot be picked
+up as annotations elsewhere), image/text/Word export, images-to-PDF (JPEG embedded without recompression, also from
 the Explorer right-click menu), and Office/Hangul-to-PDF conversion. It runs Mozilla's PDF.js
 inside a WebView2 window; no installer, no account, no telemetry, no ads.
 
