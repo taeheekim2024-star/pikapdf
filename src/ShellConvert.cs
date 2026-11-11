@@ -5,6 +5,7 @@
 //                                           명령줄·스크립트용: 창 없이, 준 순서대로. 종료 코드 0 = 성공, 1 = 일부 그림 빠짐, 2 = 실패
 // 탐색기는 여러 파일을 골라도 파일마다 프로그램을 한 번씩 띄운다. 그래서 먼저 뜬 하나가 잠깐 기다리며
 // 나머지가 보내는 경로를 모은 뒤 한꺼번에 처리한다 (이름 붙은 뮤텍스 + 파이프, 받았다는 답을 받아야 보낸 쪽이 끝난다).
+// 묶음은 "동사 + 폴더"로 나뉜다: 다른 폴더에서 거의 동시에 시작한 두 묶음이 섞이지 않는다.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -13,8 +14,10 @@ using System.IO;
 using System.IO.Pipes;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace PdfViewerApp
@@ -23,7 +26,8 @@ namespace PdfViewerApp
     {
         const string MutexBase = "Local\\PdfViewer.TaeheeKim.Img2Pdf.";
         const string PipeBase = "PdfViewer.TaeheeKim.Img2Pdf.";
-        const int DefaultIdleMs = 600;   // 이만큼 조용하면 탐색기가 다 띄운 것으로 본다
+        const int DefaultIdleMs = 800;    // 이만큼 아무도 안 오면 하나만 고른 것으로 본다
+        const int BatchIdleMs = 2000;     // 다른 경로가 하나라도 왔으면(여러 개를 고른 것) 이만큼 조용해질 때까지 모은다
 
         [DllImport("user32.dll")]
         static extern bool AllowSetForegroundWindow(int dwProcessId);
@@ -34,6 +38,22 @@ namespace PdfViewerApp
         }
 
         public static int Run(string[] args)
+        {
+            bool quiet = args.Contains("--quiet");
+            try
+            {
+                return RunCore(args);
+            }
+            catch (Exception ex)
+            {
+                // 준비 단계의 오류(경로가 너무 길다 등)가 아무 표시 없이 사라지지 않게 한다
+                Program.Log("img2pdf FATAL " + ex);
+                Message(quiet, "PDF로 만들지 못했습니다.\n\n" + ex.Message, MessageBoxIcon.Error);
+                return 2;
+            }
+        }
+
+        static int RunCore(string[] args)
         {
             string mode = args[0];
             string queue = "", outPath = null;
@@ -59,20 +79,28 @@ namespace PdfViewerApp
             bool merge = mode == "--img2pdf-merge";
             if (!merge && mode != "--img2pdf") return 2;
             if (idleMs < 100) idleMs = 100;
-
-            string key = (merge ? "merge" : "each") + (queue.Length > 0 ? "." + queue : "");
-            bool created;
-            using (var mutex = new Mutex(true, MutexBase + key, out created))
+            if (files.Count == 0)
             {
-                if (!created)
+                Message(quiet, "PDF로 바꿀 그림 파일이 없습니다.", MessageBoxIcon.Warning);
+                return 2;
+            }
+
+            string key = (merge ? "merge" : "each") + "." + FolderKey(files[0]) + (queue.Length > 0 ? "." + queue : "");
+            string pipeName = PipeBase + key + ".s" + Process.GetCurrentProcess().SessionId;   // 파이프 이름은 컴퓨터 전체에서 보이므로 세션별로
+            // 먼저 뜬 쪽이 모으는 중이면 내 경로를 넘기고 끝낸다. 넘기지 못했으면(그쪽이 막 끝났거나 죽었으면)
+            // 내가 모으는 쪽이 되어 본다. 그래도 안 되면 내 것만 직접 처리한다.
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                bool created;
+                using (var mutex = new Mutex(true, MutexBase + key, out created))
                 {
-                    // 먼저 뜬 쪽이 모으는 중 → 내 경로를 넘기고 끝낸다. 못 넘기면(그쪽이 막 끝났으면) 내가 직접 처리한다.
-                    if (Send(PipeBase + key, files)) return 0;
-                }
-                else
-                {
-                    Collect(PipeBase + key, files, idleMs);
-                    try { mutex.ReleaseMutex(); } catch { }
+                    if (created)
+                    {
+                        Collect(pipeName, files, idleMs);
+                        try { mutex.ReleaseMutex(); } catch { }
+                        break;
+                    }
+                    if (Send(pipeName, files)) return 0;
                 }
             }
             return ProcessFiles(merge, files, fit, noOpen, quiet);
@@ -83,13 +111,36 @@ namespace PdfViewerApp
             try { return Path.GetFullPath(path); } catch { return path; }
         }
 
+        // 그림이 들어 있는 폴더마다 다른 묶음이 되도록 하는 짧은 이름
+        static string FolderKey(string file)
+        {
+            string dir;
+            try { dir = Path.GetDirectoryName(file) ?? ""; } catch { dir = ""; }
+            using (var md5 = MD5.Create())
+            {
+                byte[] h = md5.ComputeHash(Encoding.UTF8.GetBytes(dir.ToLowerInvariant()));
+                var sb = new StringBuilder();
+                for (int i = 0; i < 6; i++) sb.Append(h[i].ToString("x2"));
+                return sb.ToString();
+            }
+        }
+
         // ---------- 창 없이 바로 변환 (명령줄용) ----------
 
         static int RunDirect(string outPath, List<string> files, PageFit fit)
         {
+            const string usage = "사용법: PdfViewer.exe --img2pdf-out <결과.pdf> [--a4 | --image-size] <그림> [그림 ...]";
             if (string.IsNullOrEmpty(outPath) || files.Count == 0)
             {
-                Note("사용법: PdfViewer.exe --img2pdf-out <결과.pdf> [--a4 | --image-size] <그림> [그림 ...]");
+                Note(usage);
+                return 2;
+            }
+            // 결과 경로를 빠뜨리고 그림만 주면 첫 그림이 결과 자리에 들어간다 → 그림을 PDF로 덮어쓰는 일이 없게 막는다
+            if (!string.Equals(Path.GetExtension(outPath), ".pdf", StringComparison.OrdinalIgnoreCase) ||
+                files.Any(f => string.Equals(f, outPath, StringComparison.OrdinalIgnoreCase)))
+            {
+                Note("결과 파일 이름은 .pdf 로 끝나야 하고 입력 그림과 달라야 합니다: " + outPath);
+                Note(usage);
                 return 2;
             }
             var failed = new List<string>();
@@ -128,18 +179,24 @@ namespace PdfViewerApp
             return true;
         }
 
+        static bool WriteAll(PipeStream s, byte[] buf, int timeoutMs)
+        {
+            IAsyncResult ar = s.BeginWrite(buf, 0, buf.Length, null, null);
+            if (!ar.AsyncWaitHandle.WaitOne(timeoutMs)) return false;
+            s.EndWrite(ar);
+            return true;
+        }
+
         static bool Send(string pipeName, List<string> files)
         {
             try
             {
                 using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
                 {
-                    client.Connect(4000);
+                    client.Connect(2500);
                     byte[] body = Encoding.UTF8.GetBytes(string.Join("\n", files));
                     byte[] head = BitConverter.GetBytes(body.Length);
-                    client.Write(head, 0, 4);
-                    client.Write(body, 0, body.Length);
-                    client.Flush();
+                    if (!WriteAll(client, head, 5000) || !WriteAll(client, body, 5000)) return false;
                     // 받았다는 답이 와야 넘긴 것으로 친다 (모으던 쪽이 그 순간 끝나 버리면 답이 안 온다)
                     var ack = new byte[1];
                     return ReadExact(client, ack, 1, 8000) && ack[0] == (byte)'K';
@@ -155,8 +212,8 @@ namespace PdfViewerApp
         static void Collect(string pipeName, List<string> files, int idleMs)
         {
             var sw = Stopwatch.StartNew();
-            int own = files.Count;
-            while (sw.ElapsedMilliseconds < 120000)
+            int own = files.Count, errors = 0;
+            while (sw.ElapsedMilliseconds < 120000 && errors < 20)
             {
                 NamedPipeServerStream server = null;
                 try
@@ -165,8 +222,8 @@ namespace PdfViewerApp
                         PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
                     IAsyncResult ar = server.BeginWaitForConnection(null, null);
                     // 하나만 골랐을 때는 짧게 기다리고 끝낸다. 다른 경로가 하나라도 왔으면 여러 개를 고른 것이므로
-                    // (탐색기가 느리게 띄우는 경우에도 한 묶음으로 모이도록) 조금 더 넉넉히 기다린다.
-                    int wait = files.Count > own ? Math.Max(idleMs, 1500) : idleMs;
+                    // (탐색기가 느리게 띄우는 경우에도 한 묶음으로 모이도록) 더 넉넉히 기다린다.
+                    int wait = files.Count > own ? Math.Max(idleMs, BatchIdleMs) : idleMs;
                     if (!ar.AsyncWaitHandle.WaitOne(wait) && !ar.IsCompleted) break;   // 조용해졌다 → 그만 모은다
                     server.EndWaitForConnection(ar);
                     var head = new byte[4];
@@ -175,17 +232,23 @@ namespace PdfViewerApp
                     if (len < 0 || len > (1 << 20)) continue;
                     var body = new byte[len];
                     if (len > 0 && !ReadExact(server, body, len, 5000)) continue;
+                    var got = new List<string>();
                     foreach (var line in Encoding.UTF8.GetString(body).Split('\n'))
                     {
                         string p = line.Trim();
-                        if (p.Length > 0) files.Add(p);
+                        if (p.Length > 0) got.Add(p);
                     }
-                    server.Write(new byte[] { (byte)'K' }, 0, 1);
-                    server.Flush();
-                    try { server.WaitForPipeDrain(); } catch { }
+                    // 답을 보내지 못했으면 보낸 쪽이 자기 것을 직접 처리하므로 내 목록에는 넣지 않는다 (두 번 변환되지 않게)
+                    if (!WriteAll(server, new byte[] { (byte)'K' }, 3000)) continue;
+                    files.AddRange(got);
+                    // 보낸 쪽이 답을 읽을 때까지 잠깐 기다렸다가 닫는다 (읽지 않고 멈춘 상대 때문에 끝없이 기다리지는 않는다)
+                    NamedPipeServerStream drain = server;
+                    Task t = Task.Run((Action)delegate { try { drain.WaitForPipeDrain(); } catch { } });
+                    t.Wait(2000);
                 }
                 catch (Exception ex)
                 {
+                    errors++;
                     Program.Log("img2pdf collect: " + ex.Message);
                     Thread.Sleep(30);
                 }
@@ -292,6 +355,7 @@ namespace PdfViewerApp
                 pf.Shown += delegate { timer.Start(); };
                 Application.Run(pf);
                 timer.Dispose();
+                if (!done.WaitOne(0)) cts.Cancel();   // 창이 먼저 닫혔으면 취소로 본다
             }
             done.WaitOne();
 

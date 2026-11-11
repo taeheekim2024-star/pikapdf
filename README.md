@@ -51,6 +51,7 @@ powershell -ExecutionPolicy Bypass -File .\src\build.ps1 # PdfViewer.exe 생성
 ```
 src/Program.cs      WinForms 호스트: 탭·헤더·메뉴, 파일 제공(/doc)·저장(/save)·내보내기(/export), 도구, 자체 시험
 src/ImagePdf.cs     그림 → PDF: 작은 PDF 쓰기 코드. JPEG는 그대로(DCT), PNG는 압축 데이터 그대로(Flate+예측기), 나머지는 WIC로 풀어서
+                    Flate 또는 JPEG로. 색 프로파일(ICC)은 옮기고 촬영 정보(EXIF·XMP)는 넣지 않음
 src/ShellConvert.cs 탐색기 우클릭·명령줄 변환(--img2pdf …): 파일마다 따로 뜬 프로세스들이 파이프로 모여 한 번에 처리
 inject.js           PDF.js 뷰어에 주입되는 스크립트: 저장 가로채기, 수정 감지, 단축키, 이미지·텍스트 내보내기
 start/              빈 탭의 시작 화면 (최근 문서, 공지)

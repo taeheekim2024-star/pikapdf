@@ -52,16 +52,20 @@ namespace PdfViewerApp
         public byte[] Data;
         public double DpiX, DpiY;     // 0 = 모름
         public int Orientation = 1;   // EXIF 방향 1~8
+        public byte[] Icc;            // 그림에 들어 있던 색 프로파일(ICC). 없으면 null → 기기 색(sRGB로 취급됨)
+        public int IccComponents;     // 프로파일의 색 성분 수 (1 회색, 3 RGB, 4 CMYK)
     }
 
     class JpegInfo
     {
         public int Width, Height, Components, Precision, Sof;
         public bool Adobe;
+        public bool RgbIds;           // 성분 이름이 R, G, B (YCbCr로 바꾸지 않고 저장한 JPEG)
         public double DpiX, DpiY;
         public int Orientation = 1;
         public bool Supported;        // PDF에 그대로 넣을 수 있는 JPEG인지
         public bool Complete;         // 압축 데이터가 끝 표식(EOI)까지 있는지 (없으면 중간에 끊긴 파일)
+        public byte[] Icc;            // APP2 조각들에 나뉘어 들어 있던 색 프로파일
     }
 
     class PngInfo
@@ -72,6 +76,7 @@ namespace PdfViewerApp
         public double DpiX, DpiY;
         public byte[] Idat;           // IDAT 조각들을 이은 것 (zlib 데이터)
         public long ExpectedLength;   // 풀었을 때 나와야 하는 길이
+        public byte[] IccDeflated;    // iCCP 조각의 압축된 색 프로파일
     }
 
     static class ImagePdf
@@ -204,7 +209,8 @@ namespace PdfViewerApp
         public static int Build(IList<string> images, string outPdf, PageFit fit, CancellationToken ct, Action<int, string> progress, List<string> failed)
         {
             outPdf = Path.GetFullPath(outPdf);
-            string tmp = Path.Combine(Path.GetDirectoryName(outPdf), Path.GetFileName(outPdf) + ".tmp-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            // 임시 파일은 같은 폴더에 짧은 이름으로 (최종 이름보다 길어져 경로 길이 한도에 걸리는 일이 없게)
+            string tmp = Path.Combine(Path.GetDirectoryName(outPdf), "~pdf" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp");
             int pages = 0;
             try
             {
@@ -218,19 +224,26 @@ namespace PdfViewerApp
                         ct.ThrowIfCancellationRequested();
                         string path = images[i];
                         if (progress != null) progress(i, Path.GetFileName(path));
-                        List<PdfImage> frames;
-                        try { frames = LoadImage(path, ct); }
-                        catch (OperationCanceledException) { throw; }
+                        int before = pages;
+                        Exception writeError = null;
+                        try
+                        {
+                            // 그림(여러 쪽 TIFF는 쪽마다)을 풀리는 대로 바로 쪽으로 쓴다: 한 번에 한 장만 메모리에 둔다
+                            LoadImage(path, ct, delegate(PdfImage img)
+                            {
+                                try { kids.Add(WritePage(w, pagesObj, img, fit)); }
+                                catch (Exception wex) { writeError = wex; throw; }
+                                pages++;
+                            });
+                        }
                         catch (Exception ex)
                         {
+                            if (ex is OperationCanceledException && ct.IsCancellationRequested) throw;
+                            // 그림이 아니라 PDF를 쓰다가 난 오류(디스크가 참 등)면 파일이 반쯤 쓰인 상태라 계속하지 않는다
+                            if (writeError != null) throw new IOException("PDF 파일을 쓰지 못했습니다: " + writeError.Message, writeError);
                             Program.Log("img2pdf: " + path + " : " + ex.GetType().Name + " " + ex.Message);
-                            if (failed != null) failed.Add(Path.GetFileName(path) + ": " + Describe(ex));
-                            continue;
-                        }
-                        foreach (var img in frames)
-                        {
-                            kids.Add(WritePage(w, pagesObj, img, fit));
-                            pages++;
+                            if (failed != null)
+                                failed.Add(Path.GetFileName(path) + ": " + Describe(ex) + (pages > before ? " (앞의 " + (pages - before) + "쪽까지만 들어갔습니다)" : ""));
                         }
                     }
                     if (pages > 0)
@@ -253,21 +266,24 @@ namespace PdfViewerApp
             return pages;
         }
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool MoveFileEx(string existing, string replacement, int flags);
+
+        // 임시 파일을 최종 이름으로 바꾼다. 같은 폴더 안의 이름 바꾸기 한 번이라, 실패하거나 중간에 끊겨도
+        // 이미 있던 파일이 반쯤 덮인 채로 남지 않는다 (네트워크 폴더에서도 같다).
+        // 먼저 '그냥 이름 바꾸기'를 해 보고, 같은 이름의 파일이 이미 있을 때만 '덮어쓰는 이름 바꾸기'를 한다:
+        // 덮어쓰기 표시를 붙인 호출은 대상이 없어도 한 건에 0.3~0.4초씩 걸리는 PC가 있다 (그림 100장을 따로 바꾸면 30초 넘게 차이 난다).
         static void ReplaceFile(string tmp, string target)
         {
-            if (File.Exists(target))
+            const int ReplaceExisting = 1, ErrorFileExists = 80, ErrorAlreadyExists = 183;
+            if (MoveFileEx(tmp, target, 0)) return;
+            int err = Marshal.GetLastWin32Error();
+            if (err == ErrorFileExists || err == ErrorAlreadyExists)
             {
-                try { File.Replace(tmp, target, null, true); }
-                catch
-                {
-                    File.Copy(tmp, target, true);
-                    File.Delete(tmp);
-                }
+                if (MoveFileEx(tmp, target, ReplaceExisting)) return;
+                err = Marshal.GetLastWin32Error();
             }
-            else
-            {
-                File.Move(tmp, target);
-            }
+            throw new IOException("결과 파일을 쓸 수 없습니다 (다른 프로그램이 열고 있을 수 있습니다): " + Path.GetFileName(target) + " [오류 " + err + "]");
         }
 
         static string Describe(Exception ex)
@@ -314,13 +330,15 @@ namespace PdfViewerApp
             new double[] {  0,  1, -1,  0, 1, 0 },   // 8 반시계 방향으로 90° 돌려야 바로 섬
         };
 
-        // 해상도 정보가 없거나 이상하면 96. 미터 단위로 저장된 값(95.9866, 96.012, 72.009 ...)은 가까운 정수로 맞춘다:
+        // 해상도 정보가 없거나 말이 안 되면 96. 미터 단위로 저장된 값(95.9866, 96.012, 72.009 ...)은 가까운 정수로 맞춘다:
         // 쪽 크기가 깔끔해지고, 뷰어가 100%에서 그림을 픽셀 그대로(다시 계산하지 않고) 그릴 수 있다.
+        // 현미경·분석 장비의 그림은 "1 cm에 20000픽셀" 같은 실제 축척을 해상도 칸에 적어 두기도 하는데(= 50800 dpi),
+        // 그대로 믿으면 쪽이 1 mm짜리가 되므로 범위 밖의 값은 버린다.
         static double SaneDpi(double d)
         {
-            if (double.IsNaN(d) || double.IsInfinity(d) || d < 1 || d > 100000) return 96;
+            if (double.IsNaN(d) || double.IsInfinity(d) || d < 10 || d > 20000) return 96;
             double r = Math.Round(d);
-            return (r >= 1 && Math.Abs(d - r) / r < 0.0003) ? r : d;
+            return (Math.Abs(d - r) / r < 0.0003) ? r : d;
         }
 
         static string N(double v)
@@ -336,6 +354,8 @@ namespace PdfViewerApp
             double pxW = swap ? img.Height : img.Width, pxH = swap ? img.Width : img.Height;
             double dpiX = SaneDpi(swap ? img.DpiY : img.DpiX), dpiY = SaneDpi(swap ? img.DpiX : img.DpiY);
             double natW = pxW * 72.0 / dpiX, natH = pxH * 72.0 / dpiY;   // 그림의 원래 크기 (pt)
+            // 긴 쪽이 반 인치(36 pt)도 안 되면 해상도 값이 축척 같은 다른 뜻으로 쓰인 것으로 보고 96 dpi로 다시 잡는다
+            if (Math.Max(natW, natH) < 36) { natW = pxW * 72.0 / 96; natH = pxH * 72.0 / 96; }
 
             double pageW, pageH, drawW, drawH, x0, y0;
             if (fit == PageFit.A4)
@@ -365,9 +385,31 @@ namespace PdfViewerApp
                         N(x0 + drawW * m[4]) + " " + N(y0 + drawH * m[5]);
 
             int page = w.Reserve(), content = w.Reserve(), image = w.Reserve();
+
+            // 그림에 색 프로파일이 들어 있었으면 PDF에도 넣는다 (아이폰의 Display P3, Adobe RGB 사진의 색이 달라지지 않게).
+            // 프로파일을 모르는 뷰어는 Alternate(기기 색)로 그린다.
+            string colorSpace = img.ColorSpace;
+            if (img.Icc != null && img.Icc.Length > 0)
+            {
+                string device = img.IccComponents == 1 ? "/DeviceGray" : (img.IccComponents == 4 ? "/DeviceCMYK" : "/DeviceRGB");
+                if (colorSpace == device || colorSpace.StartsWith("[/Indexed " + device + " ", StringComparison.Ordinal))
+                {
+                    int icc = w.Reserve();
+                    byte[] packed;
+                    using (var ms = new MemoryStream())
+                    {
+                        using (var z = new ZlibWriter(ms)) z.Write(img.Icc, 0, img.Icc.Length);
+                        packed = ms.ToArray();
+                    }
+                    w.StreamObject(icc, "/N " + img.IccComponents + " /Alternate " + device + " /Filter /FlateDecode", packed);
+                    string based = "[/ICCBased " + icc + " 0 R]";
+                    colorSpace = colorSpace == device ? based : "[/Indexed " + based + colorSpace.Substring(("[/Indexed " + device).Length);
+                }
+            }
+
             var d = new StringBuilder();
             d.Append("/Type /XObject /Subtype /Image /Width ").Append(img.Width).Append(" /Height ").Append(img.Height)
-             .Append(" /ColorSpace ").Append(img.ColorSpace).Append(" /BitsPerComponent ").Append(img.Bits)
+             .Append(" /ColorSpace ").Append(colorSpace).Append(" /BitsPerComponent ").Append(img.Bits)
              .Append(" /Filter ").Append(img.Filter);
             if (img.DecodeParms != null) d.Append(" /DecodeParms ").Append(img.DecodeParms);
             if (img.Decode != null) d.Append(" /Decode ").Append(img.Decode);
@@ -402,8 +444,8 @@ namespace PdfViewerApp
             }
         }
 
-        // 파일 하나 → PDF용 그림(들). 여러 쪽 TIFF만 여러 장이 나온다.
-        static List<PdfImage> LoadImage(string path, CancellationToken ct)
+        // 파일 하나를 PDF용 그림으로 바꿔 emit에 넘긴다. 여러 쪽 TIFF만 여러 번 넘긴다(쪽마다 한 번).
+        static void LoadImage(string path, CancellationToken ct, Action<PdfImage> emit)
         {
             var head = new byte[16];
             int got;
@@ -419,11 +461,16 @@ namespace PdfViewerApp
                 JpegInfo ji = ParseJpeg(data);
                 // 끝 표식이 없으면 중간에 끊긴 파일: 그대로 넣으면 아래쪽이 깨진 쪽이 조용히 만들어지므로 알린다
                 if (ji != null && !ji.Complete) throw new Exception("JPEG 데이터가 중간에 끊겼습니다 (파일이 손상되었습니다)");
-                if (ji != null && ji.Supported) return new List<PdfImage> { FromJpeg(data, ji) };
+                if (ji != null && ji.Supported)
+                {
+                    // 촬영 정보(위치·기기), 미리보기, 끝 표식 뒤에 붙은 데이터를 뺀 것을 넣는다. 그림 데이터는 그대로다.
+                    byte[] clean = CleanJpeg(data);
+                    emit(FromJpeg(clean ?? data, ji));
+                    return;
+                }
                 // 드문 JPEG(12비트, 산술 부호화 등)는 코덱으로 풀어서 다시 JPEG로 넣는다
-                var list = DecodeWithWic(path, head, 1, ct);
-                if (ji != null) foreach (var im in list) im.Orientation = ji.Orientation;
-                return list;
+                DecodeWithWic(path, head, 1, ji != null ? ji.Orientation : 0, ct, emit);
+                return;
             }
 
             if (got >= 8 && head[0] == 0x89 && head[1] == 0x50 && head[2] == 0x4E && head[3] == 0x47 &&
@@ -433,14 +480,40 @@ namespace PdfViewerApp
                 if (pi != null)
                 {
                     // 코덱은 끊긴 PNG도 읽힌 데까지만 조용히 돌려주므로, 먼저 압축 데이터가 온전한지 확인한다
-                    if (!ZlibInflatesTo(pi.Idat, pi.ExpectedLength)) throw new Exception("PNG 데이터가 손상되었습니다 (중간에 끊겼거나 깨졌습니다)");
-                    PdfImage png = PngPassthrough(pi);
-                    if (png != null) return new List<PdfImage> { png };
+                    int check = ZlibCheck(pi.Idat, pi.ExpectedLength, ct);
+                    if (check < 0) throw new Exception("PNG 데이터가 손상되었습니다 (중간에 끊겼거나 깨졌습니다)");
+                    // 기대보다 길게 풀리면(여분 데이터) 손상은 아니지만 그대로 넣지는 않고 코덱에 맡긴다
+                    PdfImage png = check == 0 ? PngPassthrough(pi) : null;
+                    if (png != null) { emit(png); return; }
                 }
-                return DecodeWithWic(path, head, 2, ct);
+                DecodeWithWic(path, head, 2, 0, ct, emit);
+                return;
             }
 
-            return DecodeWithWic(path, head, 0, ct);
+            DecodeWithWic(path, head, 0, 0, ct, emit);
+        }
+
+        // ---------- 색 프로파일 ----------
+
+        // ICC 프로파일이 멀쩡해 보이면 색 성분 수(1, 3, 4)를, 아니면 0을 돌려준다
+        static int IccComponentsOf(byte[] icc)
+        {
+            if (icc == null || icc.Length < 132 || icc.Length > 16 * 1024 * 1024) return 0;
+            if (icc[36] != (byte)'a' || icc[37] != (byte)'c' || icc[38] != (byte)'s' || icc[39] != (byte)'p') return 0;
+            string space = Encoding.ASCII.GetString(icc, 16, 4);
+            if (space == "RGB ") return 3;
+            if (space == "GRAY") return 1;
+            if (space == "CMYK") return 4;
+            return 0;
+        }
+
+        // 프로파일의 성분 수가 그림과 맞을 때만 붙인다
+        static void AttachIcc(PdfImage img, byte[] icc, int imageComponents)
+        {
+            int n = IccComponentsOf(icc);
+            if (n == 0 || n != imageComponents) return;
+            img.Icc = icc;
+            img.IccComponents = n;
         }
 
         // ---------- JPEG ----------
@@ -454,9 +527,64 @@ namespace PdfViewerApp
             img.ColorSpace = ji.Components == 1 ? "/DeviceGray" : (ji.Components == 3 ? "/DeviceRGB" : "/DeviceCMYK");
             // Adobe 계열 프로그램이 쓴 CMYK JPEG는 값이 뒤집혀 저장된다
             if (ji.Components == 4 && ji.Adobe) img.Decode = "[1 0 1 0 1 0 1 0]";
+            // 성분 이름이 R, G, B이고 Adobe 표식이 없는 JPEG는 YCbCr로 바꾸지 않은 것이므로, 뷰어도 바꾸지 말라고 알린다
+            if (ji.Components == 3 && ji.RgbIds && !ji.Adobe) img.DecodeParms = "<< /ColorTransform 0 >>";
             img.DpiX = ji.DpiX; img.DpiY = ji.DpiY;
             img.Orientation = ji.Orientation;
+            AttachIcc(img, ji.Icc, ji.Components);
             return img;
+        }
+
+        // 그림을 그리는 데 필요 없는 조각을 뺀 JPEG를 만든다: 촬영 정보(EXIF: 위치·기기·미리보기), XMP, 주석, 색 프로파일 조각
+        // (프로파일은 PDF 쪽에 따로 넣는다), 그리고 끝 표식 뒤에 붙은 데이터(모션 포토의 동영상 등).
+        // 압축된 그림 데이터는 한 바이트도 바꾸지 않는다. 구조가 예상과 다르면 null을 돌려주고, 그때는 원본을 그대로 쓴다.
+        static byte[] CleanJpeg(byte[] d)
+        {
+            int n = d.Length;
+            if (n < 4 || d[0] != 0xFF || d[1] != 0xD8) return null;
+            using (var o = new MemoryStream(n))
+            {
+                o.WriteByte(0xFF); o.WriteByte(0xD8);
+                int p = 2;
+                while (true)
+                {
+                    if (p + 1 >= n) return null;
+                    if (d[p] != 0xFF) { p++; continue; }          // 표식 사이에 낀 군더더기 바이트: 디코더도 건너뛰는 것이라 버린다
+                    while (p + 1 < n && d[p + 1] == 0xFF) p++;   // 채움 바이트
+                    if (p + 1 >= n) return null;
+                    int m = d[p + 1];
+                    if (m == 0xD9) { o.WriteByte(0xFF); o.WriteByte(0xD9); break; }                                   // 끝: 뒤에 붙은 것은 버린다
+                    if (m == 0x01 || (m >= 0xD0 && m <= 0xD7)) { o.WriteByte(0xFF); o.WriteByte((byte)m); p += 2; continue; }
+                    if (m == 0x00 || m == 0xD8) { p += 2; continue; }   // 머리 부분에 있을 이유가 없는 표식: ParseJpeg와 같이 건너뛴다
+                    if (p + 3 >= n) return null;
+                    int len = (d[p + 2] << 8) | d[p + 3];
+                    if (len < 2 || p + 2 + len > n) return null;
+                    // APP1~APP15(EXIF, XMP, ICC, IPTC ...)와 주석을 뺀다. APP0(JFIF)과 APP14(Adobe: 색 처리 방식)는 남긴다.
+                    bool drop = (m >= 0xE1 && m <= 0xEF && m != 0xEE) || m == 0xFE;
+                    if (!drop) o.Write(d, p, 2 + len);
+                    p += 2 + len;
+                    if (m == 0xDA)
+                    {
+                        // 압축 데이터: 다음 표식(FF 뒤가 00도, 다시 시작 표식 D0~D7도 아닌 것)이 나올 때까지 그대로 복사
+                        int q = p;
+                        while (true)
+                        {
+                            if (q + 1 >= n) return null;
+                            if (d[q] == 0xFF)
+                            {
+                                int x = d[q + 1];
+                                if (x == 0x00 || (x >= 0xD0 && x <= 0xD7)) { q += 2; continue; }
+                                if (x == 0xFF) { q++; continue; }
+                                break;
+                            }
+                            q++;
+                        }
+                        o.Write(d, p, q - p);
+                        p = q;
+                    }
+                }
+                return o.ToArray();
+            }
         }
 
         static int U16(byte[] d, long p, bool le)
@@ -485,6 +613,8 @@ namespace PdfViewerApp
             double exifX = 0, exifY = 0;
             int exifUnit = 2;
             bool jfifDpi = false, sofSeen = false, exifSeen = false;
+            Dictionary<int, int[]> iccParts = null;
+            int iccTotal = 0;
             int p = 2, n = d.Length, sos = -1;
             while (p + 1 < n)
             {
@@ -517,6 +647,13 @@ namespace PdfViewerApp
                 {
                     ji.Adobe = true;
                 }
+                else if (m == 0xE2 && sl > 14 && Starts(d, s, sl, "ICC_PROFILE\0"))
+                {
+                    // 색 프로파일은 여러 조각으로 나뉘어 있을 수 있다: (조각 번호, 전체 조각 수, 데이터)
+                    int seq = d[s + 12], total = d[s + 13];
+                    if (iccParts == null) iccParts = new Dictionary<int, int[]>();
+                    if (seq >= 1 && seq <= total && !iccParts.ContainsKey(seq)) { iccParts[seq] = new[] { s + 14, sl - 14 }; iccTotal = total; }
+                }
                 else if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC)
                 {
                     if (sl >= 6 && !sofSeen)
@@ -527,9 +664,20 @@ namespace PdfViewerApp
                         ji.Height = (d[s + 1] << 8) | d[s + 2];
                         ji.Width = (d[s + 3] << 8) | d[s + 4];
                         ji.Components = d[s + 5];
+                        if (ji.Components == 3 && sl >= 6 + 9)
+                            ji.RgbIds = d[s + 6] == (byte)'R' && d[s + 9] == (byte)'G' && d[s + 12] == (byte)'B';
                     }
                 }
                 p += 2 + len;
+            }
+            if (iccParts != null && iccTotal > 0 && iccParts.Count == iccTotal)
+            {
+                int size = 0;
+                for (int i = 1; i <= iccTotal; i++) size += iccParts[i][1];
+                var icc = new byte[size];
+                int at = 0;
+                for (int i = 1; i <= iccTotal; i++) { Buffer.BlockCopy(d, iccParts[i][0], icc, at, iccParts[i][1]); at += iccParts[i][1]; }
+                ji.Icc = icc;
             }
             if (!jfifDpi)
             {
@@ -629,6 +777,16 @@ namespace PdfViewerApp
                         if (d[s + 8] == 1 && ux > 0 && uy > 0) { pi.DpiX = ux * 0.0254; pi.DpiY = uy * 0.0254; }
                     }
                     else if (type == "IDAT") idat.Write(d, s, cl);
+                    else if (type == "iCCP" && pi.IccDeflated == null)
+                    {
+                        // 이름(1~79자) + 0 + 압축 방식(0) + zlib으로 압축한 프로파일
+                        int z0 = Array.IndexOf(d, (byte)0, s, Math.Min(cl, 80));
+                        if (z0 >= s && z0 + 2 < s + cl && d[z0 + 1] == 0)
+                        {
+                            pi.IccDeflated = new byte[s + cl - (z0 + 2)];
+                            Buffer.BlockCopy(d, z0 + 2, pi.IccDeflated, 0, pi.IccDeflated.Length);
+                        }
+                    }
                     else if (type == "CgBI") return null;   // 애플 변형 PNG는 표준이 아님
                     else if (type == "IEND") break;
                     p = ds + clen + 4;
@@ -694,14 +852,43 @@ namespace PdfViewerApp
             img.DecodeParms = "<< /Predictor 15 /Colors " + colors + " /BitsPerComponent " + bd + " /Columns " + pi.Width + " >>";
             img.Data = pi.Idat;
             img.DpiX = pi.DpiX; img.DpiY = pi.DpiY;
+            AttachIcc(img, Inflate(pi.IccDeflated, 16 * 1024 * 1024), colors == 3 || pi.ColorType == 3 ? 3 : 1);
             return img;
         }
 
-        // zlib 데이터가 멀쩡하고, 풀면 기대한 길이가 나오는지 (깨진 PNG를 그대로 넣지 않으려고)
-        static bool ZlibInflatesTo(byte[] z, long expected)
+        static bool ZlibHeaderOk(byte[] z)
         {
-            if (z == null || z.Length < 8) return false;
-            if ((z[0] & 0x0F) != 8 || ((z[0] << 8) | z[1]) % 31 != 0 || (z[1] & 0x20) != 0) return false;
+            return z != null && z.Length >= 8 && (z[0] & 0x0F) == 8 && ((z[0] << 8) | z[1]) % 31 == 0 && (z[1] & 0x20) == 0;
+        }
+
+        // zlib 데이터를 푼다 (작은 것 전용: 색 프로파일). 깨졌거나 limit보다 크면 null.
+        static byte[] Inflate(byte[] z, int limit)
+        {
+            if (!ZlibHeaderOk(z)) return null;
+            try
+            {
+                using (var ms = new MemoryStream(z, 2, z.Length - 2))
+                using (var inf = new DeflateStream(ms, CompressionMode.Decompress))
+                using (var o = new MemoryStream())
+                {
+                    var buf = new byte[1 << 14];
+                    int r;
+                    while ((r = inf.Read(buf, 0, buf.Length)) > 0)
+                    {
+                        if (o.Length + r > limit) return null;
+                        o.Write(buf, 0, r);
+                    }
+                    return o.ToArray();
+                }
+            }
+            catch { return null; }
+        }
+
+        // zlib 데이터를 풀어 보고 길이를 기대값과 견준다 (깨진 PNG를 그대로 넣지 않으려고).
+        // 0 = 기대한 길이 그대로, 1 = 더 길게 풀림(여분 데이터가 있음), -1 = 손상(짧거나 풀다가 오류)
+        static int ZlibCheck(byte[] z, long expected, CancellationToken ct)
+        {
+            if (!ZlibHeaderOk(z)) return -1;
             try
             {
                 using (var ms = new MemoryStream(z, 2, z.Length - 2))
@@ -709,16 +896,18 @@ namespace PdfViewerApp
                 {
                     var buf = new byte[1 << 16];
                     long total = 0;
-                    int r;
+                    int r, rounds = 0;
                     while ((r = inf.Read(buf, 0, buf.Length)) > 0)
                     {
                         total += r;
-                        if (total > expected) return false;
+                        if (total > expected) return 1;
+                        if ((++rounds & 255) == 0) ct.ThrowIfCancellationRequested();
                     }
-                    return total == expected;
+                    return total == expected ? 0 : -1;
                 }
             }
-            catch { return false; }
+            catch (OperationCanceledException) { throw; }
+            catch { return -1; }
         }
 
         // ---------- 그 밖의 형식: Windows 이미지 코덱(WIC)으로 풀기 ----------
@@ -754,32 +943,97 @@ namespace PdfViewerApp
             return false;
         }
 
-        // mode: 0 = 형식을 보고 정함, 1 = JPEG로, 2 = 무손실로
-        static List<PdfImage> DecodeWithWic(string path, byte[] head, int mode, CancellationToken ct)
+        const long MaxPixels = 400L * 1000 * 1000;   // 한 장에 4억 화소까지 (그 이상은 메모리가 감당하기 어렵다)
+
+        // 그림에 딸린 정보 한 칸을 읽는다 (TIFF의 꼬리표 등). 없거나 읽을 수 없으면 fallback.
+        static int MetaInt(BitmapSource frame, string query, int fallback)
         {
-            BitmapDecoder dec;
+            try
+            {
+                var bf = frame as BitmapFrame;
+                var md = bf != null ? bf.Metadata as BitmapMetadata : null;
+                object v = md != null ? md.GetQuery(query) : null;
+                if (v is ushort) return (ushort)v;
+                if (v is uint) return (int)(uint)v;
+                if (v is byte) return (byte)v;
+                if (v is int) return (int)v;
+                var arr = v as ushort[];
+                if (arr != null && arr.Length > 0) return arr[0];
+            }
+            catch { }
+            return fallback;
+        }
+
+        // 코덱이 알려 주는 색 프로파일을 붙인다 (성분 수가 맞을 때만)
+        static void AttachFrameIcc(PdfImage img, BitmapSource frame)
+        {
+            if (img.Icc != null) return;
+            int comps = img.ColorSpace == "/DeviceGray" ? 1 : (img.ColorSpace == "/DeviceRGB" ? 3 : 0);
+            if (comps == 0) return;
+            try
+            {
+                var bf = frame as BitmapFrame;
+                var contexts = bf != null ? bf.ColorContexts : null;
+                if (contexts == null || contexts.Count == 0) return;
+                using (Stream s = contexts[0].OpenProfileStream())
+                using (var ms = new MemoryStream())
+                {
+                    s.CopyTo(ms);
+                    AttachIcc(img, ms.ToArray(), comps);
+                }
+            }
+            catch { }
+        }
+
+        // mode: 0 = 형식을 보고 정함, 1 = JPEG로, 2 = 무손실로. orientation이 1~8이면 그 방향을 쓴다(코덱으로 푸는 JPEG용).
+        static void DecodeWithWic(string path, byte[] head, int mode, int orientation, CancellationToken ct, Action<PdfImage> emit)
+        {
             using (var fs = OpenShared(path))
             {
-                dec = BitmapDecoder.Create(fs, BitmapCreateOptions.PreservePixelFormat | BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.OnLoad);
-            }
-            bool lossless;
-            if (mode == 1) lossless = false;
-            else if (mode == 2) lossless = true;
-            else if (dec is PngBitmapDecoder || dec is BmpBitmapDecoder || dec is GifBitmapDecoder || dec is TiffBitmapDecoder || dec is IconBitmapDecoder) lossless = true;
-            else if (IsWebp(head)) lossless = WebpIsLossless(path);
-            else lossless = false;   // HEIC, AVIF, JPEG XR, 카메라 RAW 등
+                // 프레임을 미리 풀어 두지 않는다(DelayCreation, 캐시 없음): 여러 쪽 TIFF를 열 때 모든 쪽이 한꺼번에
+                // 메모리에 올라가지 않도록 한 장씩 풀어서 바로 쪽으로 쓴다. 그래서 파일은 다 쓸 때까지 열어 둔다.
+                BitmapDecoder dec = BitmapDecoder.Create(fs,
+                    BitmapCreateOptions.PreservePixelFormat | BitmapCreateOptions.IgnoreColorProfile | BitmapCreateOptions.DelayCreation,
+                    BitmapCacheOption.None);
+                bool tiff = dec is TiffBitmapDecoder;
+                bool lossless;
+                if (mode == 1) lossless = false;
+                else if (mode == 2) lossless = true;
+                else if (dec is PngBitmapDecoder || dec is BmpBitmapDecoder || dec is GifBitmapDecoder || tiff || dec is IconBitmapDecoder) lossless = true;
+                else if (IsWebp(head)) lossless = WebpIsLossless(path);
+                else lossless = false;   // HEIC, AVIF, JPEG XR, 카메라 RAW 등
 
-            // 여러 쪽 TIFF만 모든 프레임을 쓴다 (GIF의 프레임은 움직임, ICO의 프레임은 크기별 사본)
-            int count = dec is TiffBitmapDecoder ? dec.Frames.Count : 1;
-            if (dec.Frames.Count == 0) throw new NotSupportedException();
-            var result = new List<PdfImage>();
-            for (int i = 0; i < count; i++)
-            {
-                ct.ThrowIfCancellationRequested();
-                BitmapSource frame = dec.Frames[i];
-                result.Add(lossless ? EncodeFlate(frame, ct) : EncodeJpeg(frame));
+                int total = dec.Frames.Count;
+                if (total == 0) throw new NotSupportedException();
+                var pick = new List<int>();
+                if (tiff)
+                {
+                    // 여러 쪽 TIFF는 쪽마다 한 장. 미리보기·축소본으로 표시된 쪽(NewSubfileType의 첫 비트)은 뺀다.
+                    for (int i = 0; i < total; i++)
+                        if ((MetaInt(dec.Frames[i], "/ifd/{ushort=254}", 0) & 1) == 0) pick.Add(i);
+                    if (pick.Count == 0) pick.Add(0);
+                }
+                else pick.Add(0);   // GIF의 프레임은 움직임, ICO의 프레임은 크기별 사본이라 첫 장만 쓴다
+
+                foreach (int i in pick)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    BitmapSource frame = dec.Frames[i];
+                    if ((long)frame.PixelWidth * frame.PixelHeight > MaxPixels) throw new OverflowException();
+                    // TIFF의 넷째 채널이 "뜻이 정해지지 않음"(ExtraSamples = 0: 적외선 채널, 자리 채우기 등)이면 투명도로 보지 않는다
+                    bool ignoreAlpha = tiff && MetaInt(frame, "/ifd/{ushort=338}", -1) == 0;
+                    PdfImage img = lossless ? EncodeFlate(frame, ignoreAlpha, ct) : EncodeJpeg(frame, ignoreAlpha);
+                    if (orientation >= 1 && orientation <= 8) img.Orientation = orientation;
+                    else if (tiff)
+                    {
+                        // TIFF의 방향 꼬리표(274)는 코덱이 돌려 주지 않으므로 직접 반영한다 (HEIC는 코덱이 이미 돌려서 준다)
+                        int o = MetaInt(frame, "/ifd/{ushort=274}", 1);
+                        if (o >= 1 && o <= 8) img.Orientation = o;
+                    }
+                    AttachFrameIcc(img, frame);
+                    emit(img);
+                }
             }
-            return result;
         }
 
         static bool IsGray(PixelFormat f)
@@ -828,8 +1082,26 @@ namespace PdfViewerApp
             }
         }
 
+        // 그림 한 장을 한 번에 푼다 (조각조각 요청하면 코덱에 따라 그때마다 처음부터 다시 풀 수 있다)
+        static byte[] Grab(BitmapSource s, int stride, int h)
+        {
+            long total = (long)stride * h;
+            if (total > int.MaxValue - 64) throw new OverflowException();
+            var px = new byte[(int)total];
+            s.CopyPixels(px, stride, 0);
+            return px;
+        }
+
+        // 알파가 전부 0인 그림은 "완전히 투명한 그림"이 아니라 넷째 채널이 비어 있는 것이다 → 불투명으로 본다
+        static bool AlphaAllZero(byte[] bgra)
+        {
+            if (bgra.Length < 4) return false;
+            for (int i = 3; i < bgra.Length; i += 4) if (bgra[i] != 0) return false;
+            return true;
+        }
+
         // 무손실: Flate로 다시 압축 (8비트 회색·RGB는 PNG 예측기를 써서 PNG와 비슷한 크기가 되게, 흑백 1비트는 그대로)
-        static PdfImage EncodeFlate(BitmapSource src, CancellationToken ct)
+        static PdfImage EncodeFlate(BitmapSource src, bool ignoreAlpha, CancellationToken ct)
         {
             int w = src.PixelWidth, h = src.PixelHeight;
             if (w <= 0 || h <= 0) throw new NotSupportedException();
@@ -846,48 +1118,36 @@ namespace PdfViewerApp
                     {
                         // 1비트: 0 = 검정, 1 = 흰색 (PDF의 DeviceGray와 같음)
                         img.ColorSpace = "/DeviceGray"; img.Bits = 1;
-                        int stride = (w + 7) / 8;
-                        int rows = Math.Max(1, Math.Min(h, (1 << 20) / stride));
-                        var buf = new byte[stride * rows];
-                        for (int y = 0; y < h; y += rows)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            int n = Math.Min(rows, h - y);
-                            src.CopyPixels(new System.Windows.Int32Rect(0, y, w, n), buf, stride, 0);
-                            z.Write(buf, 0, stride * n);
-                        }
+                        byte[] px = Grab(src, (w + 7) / 8, h);
+                        z.Write(px, 0, px.Length);
                     }
                     else
                     {
                         bool gray = IsGray(f);
-                        bool alpha = !gray && HasAlpha(src);
+                        bool alpha = !gray && !ignoreAlpha && HasAlpha(src);
                         PixelFormat want = gray ? PixelFormats.Gray8 : (alpha ? PixelFormats.Bgra32 : PixelFormats.Bgr24);
                         BitmapSource conv = f == want ? src : new FormatConvertedBitmap(src, want, null, 0);
                         int srcBpp = gray ? 1 : (alpha ? 4 : 3), outBpp = gray ? 1 : 3;
                         if ((long)w * srcBpp > int.MaxValue / 4) throw new OverflowException();
                         int srcStride = w * srcBpp, rowLen = w * outBpp;
+                        byte[] px = Grab(conv, srcStride, h);
+                        bool composite = alpha && !AlphaAllZero(px);
                         img.ColorSpace = gray ? "/DeviceGray" : "/DeviceRGB"; img.Bits = 8;
                         img.DecodeParms = "<< /Predictor 15 /Colors " + outBpp + " /BitsPerComponent 8 /Columns " + w + " >>";
                         var filter = new PngRowFilter(rowLen, outBpp, z);
-                        int rows = Math.Max(1, Math.Min(h, (4 << 20) / srcStride));
-                        var buf = new byte[srcStride * rows];
                         var row = new byte[rowLen];
-                        for (int y = 0; y < h; y += rows)
+                        for (int y = 0; y < h; y++)
                         {
-                            ct.ThrowIfCancellationRequested();
-                            int n = Math.Min(rows, h - y);
-                            conv.CopyPixels(new System.Windows.Int32Rect(0, y, w, n), buf, srcStride, 0);
-                            for (int r = 0; r < n; r++)
+                            if ((y & 255) == 0) ct.ThrowIfCancellationRequested();
+                            int so = y * srcStride;
+                            if (gray) Buffer.BlockCopy(px, so, row, 0, rowLen);
+                            else if (composite) CompositeRow(px, so, row, w);
+                            else
                             {
-                                int so = r * srcStride;
-                                if (gray) Buffer.BlockCopy(buf, so, row, 0, rowLen);
-                                else if (alpha) CompositeRow(buf, so, row, w);
-                                else
-                                {
-                                    for (int x = 0, i = so; x < rowLen; x += 3, i += 3) { row[x] = buf[i + 2]; row[x + 1] = buf[i + 1]; row[x + 2] = buf[i]; }
-                                }
-                                filter.WriteRow(row);
+                                // BGR(또는 알파를 쓰지 않는 BGRA) → RGB
+                                for (int x = 0, i = so; x < rowLen; x += 3, i += srcBpp) { row[x] = px[i + 2]; row[x + 1] = px[i + 1]; row[x + 2] = px[i]; }
                             }
+                            filter.WriteRow(row);
                         }
                     }
                 }
@@ -897,13 +1157,25 @@ namespace PdfViewerApp
         }
 
         // 손실 형식에서 온 그림: 무손실로 넣으면 몇 배로 커지므로 JPEG(품질 92)로 넣는다
-        static PdfImage EncodeJpeg(BitmapSource src)
+        static PdfImage EncodeJpeg(BitmapSource src, bool ignoreAlpha)
         {
             PixelFormat f = src.Format;
+            int w = src.PixelWidth, h = src.PixelHeight;
+            if (w <= 0 || h <= 0) throw new NotSupportedException();
+            // 먼저 메모리로 한 번에 풀어 놓고 거기서 JPEG를 만든다
             BitmapSource rgb;
-            if (HasAlpha(src)) rgb = FlattenOnWhite(src);
-            else if (IsGray(f)) rgb = f == PixelFormats.Gray8 ? src : new FormatConvertedBitmap(src, PixelFormats.Gray8, null, 0);
-            else rgb = f == PixelFormats.Bgr24 ? src : new FormatConvertedBitmap(src, PixelFormats.Bgr24, null, 0);
+            if (IsGray(f))
+            {
+                BitmapSource g = f == PixelFormats.Gray8 ? src : new FormatConvertedBitmap(src, PixelFormats.Gray8, null, 0);
+                rgb = BitmapSource.Create(w, h, 96, 96, PixelFormats.Gray8, null, Grab(g, w, h), w);
+            }
+            else if (!ignoreAlpha && HasAlpha(src)) rgb = FlattenOnWhite(src);
+            else
+            {
+                if ((long)w * 3 > int.MaxValue / 4) throw new OverflowException();
+                BitmapSource c = f == PixelFormats.Bgr24 ? src : new FormatConvertedBitmap(src, PixelFormats.Bgr24, null, 0);
+                rgb = BitmapSource.Create(w, h, 96, 96, PixelFormats.Bgr24, null, Grab(c, w * 3, h), w * 3);
+            }
             var enc = new JpegBitmapEncoder();
             enc.QualityLevel = JpegQuality;
             enc.Frames.Add(BitmapFrame.Create(rgb));
@@ -926,17 +1198,24 @@ namespace PdfViewerApp
             int w = src.PixelWidth, h = src.PixelHeight;
             if ((long)w * h * 4 > int.MaxValue - 64) throw new OverflowException();
             BitmapSource conv = src.Format == PixelFormats.Bgra32 ? src : new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
-            var px = new byte[w * 4 * h];
-            conv.CopyPixels(px, w * 4, 0);
+            byte[] px = Grab(conv, w * 4, h);
+            bool composite = !AlphaAllZero(px);   // 알파가 전부 0이면 넷째 채널이 비어 있는 것 → 색만 쓴다
             var bgr = new byte[w * 3 * h];
             var row = new byte[w * 3];
             for (int y = 0; y < h; y++)
             {
-                CompositeRow(px, y * w * 4, row, w);
-                int o = y * w * 3;
-                for (int x = 0; x < row.Length; x += 3) { bgr[o + x] = row[x + 2]; bgr[o + x + 1] = row[x + 1]; bgr[o + x + 2] = row[x]; }
+                int so = y * w * 4, o = y * w * 3;
+                if (composite)
+                {
+                    CompositeRow(px, so, row, w);
+                    for (int x = 0; x < row.Length; x += 3) { bgr[o + x] = row[x + 2]; bgr[o + x + 1] = row[x + 1]; bgr[o + x + 2] = row[x]; }
+                }
+                else
+                {
+                    for (int x = 0, i = so; x < row.Length; x += 3, i += 4) { bgr[o + x] = px[i]; bgr[o + x + 1] = px[i + 1]; bgr[o + x + 2] = px[i + 2]; }
+                }
             }
-            BitmapSource result = BitmapSource.Create(w, h, src.DpiX, src.DpiY, PixelFormats.Bgr24, null, bgr, w * 3);
+            BitmapSource result = BitmapSource.Create(w, h, 96, 96, PixelFormats.Bgr24, null, bgr, w * 3);
             result.Freeze();
             return result;
         }
@@ -1068,6 +1347,8 @@ namespace PdfViewerApp
         public void Finish(int root, int info, string id)
         {
             long xref = s.Position;
+            // 교차 참조표의 위치 칸은 10자리다
+            if (xref > 9999999999L) throw new IOException("PDF가 너무 큽니다 (10 GB를 넘음)");
             var sb = new StringBuilder();
             sb.Append("xref\n0 ").Append(offsets.Count + 1).Append("\n0000000000 65535 f \n");
             foreach (long o in offsets) sb.Append(o.ToString("0000000000", CultureInfo.InvariantCulture)).Append(" 00000 n \n");

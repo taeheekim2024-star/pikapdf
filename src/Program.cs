@@ -3051,9 +3051,22 @@ namespace PdfViewerApp
         readonly Label label;
         public readonly CancellationTokenSource Cts = new CancellationTokenSource();
         bool finished;
+        readonly bool canCancel;
+
+        // 작업이 끝나기 전에 창을 닫으려 하면(Alt+F4 등): 취소할 수 있는 작업은 취소로 받아들이고, 아니면 끝날 때까지 닫지 않는다
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (!finished && e.CloseReason == CloseReason.UserClosing)
+            {
+                if (canCancel) { try { Cts.Cancel(); } catch { } }
+                else { e.Cancel = true; return; }
+            }
+            base.OnFormClosing(e);
+        }
 
         public ProgressForm(string title, string message, bool cancellable)
         {
+            canCancel = cancellable;
             AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
             Font = new Font("Malgun Gothic", 9F);
