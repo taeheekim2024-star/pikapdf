@@ -3402,7 +3402,7 @@ namespace PdfViewerApp
             each = AddRadio("그림마다 PDF 하나씩 (그림 옆에 저장)", 24, 184, 390, !together);
             EndGroup();
             if (files.Count < 2) { merge.Enabled = false; each.Enabled = false; }
-            AddLabel("JPG는 화질 그대로, PNG 등은 무손실로 들어갑니다. 쪽 순서는 만든 뒤 왼쪽 썸네일에서 바꿀 수 있습니다.", 16, 216, 408, 40);
+            AddLabel("JPG는 화질 그대로, PNG 등은 무손실로 들어갑니다." + Environment.NewLine + "쪽 순서는 만든 뒤 왼쪽 썸네일에서 바꿀 수 있습니다.", 16, 216, 408, 40);
         }
 
         public PageFit Fit { get { return fitA4.Checked ? PageFit.A4 : PageFit.Image; } }
