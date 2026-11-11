@@ -52,7 +52,9 @@
   var exportNext = false;    // 다음 저장은 "추출한 페이지를 다른 파일로"
   var rotateSaveNext = false; // 다음 저장은 "회전 저장" (끝나면 다시 불러옴)
   var cancelled = false;     // 내보내기 취소 요청
-  var flattenAuto = false;   // 저장할 때 서명·그림을 쪽 내용으로 박아 넣기 (호스트의 설정; 문서가 열리면 호스트가 알려 준다)
+  var flattenAuto = false;   // 저장할 때 서명·그림을 쪽 내용으로 박아 넣기 (호스트의 설정; 이 스크립트가 시작하면서 물어 받는다)
+  var carriedRects = [];     // 합치기로 다시 불러온 문서에 주석으로 들어가 있는 "아직 박지 못한 서명·그림"의 자리들
+  var carryNext = null;      // 합치기가 끝나 새 문서가 열리면 carriedRects 가 될 것
   var workerSaved = false;   // 방금 넘어온 저장 데이터가 PDF.js의 저장 처리(SaveDocument)를 거친 것인지
   var saveFailed = false;    // 방금 PDF.js의 저장 처리가 실패했는지 (그 뒤에 넘어오는 것은 수정 내용이 빠진 원본이다)
 
@@ -135,17 +137,18 @@
 
   // 서명·주석 박아 넣기: pdf.js(패치됨)가 저장할 때 주석의 모양을 쪽 내용으로 옮기고 주석 목록에서 뺀다.
   // 그러면 다른 프로그램에서 주석처럼 따로 집어 옮기거나 복사·삭제할 수 없다.
-  //   평소 저장: 설정이 켜져 있으면 이번 저장에서 새로 넣었거나 고친 서명·그림(Stamp)만
+  //   평소 저장: 설정이 켜져 있으면 이번 저장에서 새로 넣었거나 자리를 옮긴 서명·그림(Stamp)만
   //   도구 메뉴: 고른 종류를 문서에 이미 있던 것까지 전부 (끝나면 다시 불러옴)
+  var INFO_KEYS = ["done", "skipped", "blocked", "failedPages", "noAppearance", "special", "comment", "overlap", "content"];
   function setFlattenDefault() {
     try {
       var tr = app && app.pdfDocument && app.pdfDocument._transport;
       if (!tr) return;
       tr.pkFlatten = flattenAuto ? { subtypes: ["Stamp"], all: false } : null;
       if (!tr.__hostSaveWrapped) {
-        // 저장 데이터가 PDF.js의 저장 처리를 거쳤는지 표시해 둔다 (거치지 않은 "원본 그대로 저장"과 구별).
+        // 저장 데이터가 PDF.js의 저장 처리를 거쳤는지 표시해 둔다 (거치지 않은 "원본 그대로 저장"·"쪽 편집 저장"과 구별).
         // 저장 처리가 실패하면 PDF.js는 원본을 그대로 내려받는 쪽으로 넘어가는데, 그것을 파일에 덮어쓰면
-        // 수정한 내용이 빠진 채 "저장됨"이 되므로 실패도 표시해 둔다.
+        // 수정한 내용이 빠진 채 "저장됨"이 되므로 실패도 표시해 둔다 (아래 download 에서 확인하고 지운다).
         var orig = tr.saveDocument;
         tr.__hostSaveWrapped = true;
         tr.saveDocument = function () {
@@ -155,7 +158,6 @@
             function (d) { workerSaved = true; return d; },
             function (e) {
               saveFailed = true;
-              setTimeout(function () { saveFailed = false; }, 3000);
               post("log|saveDocument failed: " + (e && e.message ? e.message : e));
               throw e;
             });
@@ -163,22 +165,95 @@
       }
     } catch (e) {}
   }
-  // 방금 끝난 저장에서 박아 넣은 결과 { done, skipped, blocked, failedPages } (한 번 읽으면 지워진다)
-  function flattenResult() {
+  // 방금 끝난 저장에서 박아 넣은 결과 { done, skipped, blocked, failedPages, 이유별 수 } (한 번 읽으면 지워진다)
+  function flattenResult(transport) {
     try {
-      var tr = app.pdfDocument._transport;
+      var tr = transport || app.pdfDocument._transport;
       return tr.messageHandler.sendWithPromise("PkFlattenResult", null).then(null, function () { return null; });
     } catch (e) { return Promise.resolve(null); }
+  }
+  function addInfo(a, b) {
+    if (!a && !b) return null;
+    var o = {};
+    for (var i = 0; i < INFO_KEYS.length; i++) {
+      var k = INFO_KEYS[i];
+      o[k] = ((a && a[k]) | 0) + ((b && b[k]) | 0);
+    }
+    return o;
+  }
+  function encodeInfo(o) {
+    var s = "";
+    for (var k in o) s += k + "=" + String(o[k]).replace(/[;\r\n]/g, " ") + ";";
+    return s;
   }
   function postSave(data, name, query) {
     var body = (typeof Blob !== "undefined" && data instanceof Blob) ? data : new Blob([data], { type: "application/pdf" });
     return fetch("https://pdfjs.local/save/" + encodeURIComponent(name) + (query || ""), { method: "POST", body: body, cache: "no-store" })
       .then(function (r) { return r.json(); });
   }
+  // 저장소에 있는 "새로 넣었거나 자리를 옮긴" 서명·그림의 자리(쪽 좌표 사각형)들
+  function pendingStampRects() {
+    var out = [];
+    try {
+      var T = globalThis.pdfjsLib.AnnotationEditorType;
+      var st = app.pdfDocument.annotationStorage;
+      var ser = st.serializable;
+      if (!ser || !ser.map) return out;
+      ser.map.forEach(function (v, key) {
+        if (!v) return;
+        var rawValue = st.getRawValue(key);
+        var isEditor = rawValue !== v;       // 편집기는 매번 새로 직렬화된 사본을 내놓는다
+        // 직렬화하며 만들어진 그림 사본은 여기서 쓰지 않으므로 바로 닫는다 (저장소에 직접 든 객체의 그림은 닫으면 안 된다)
+        if (isEditor) { try { if (v.bitmap && typeof v.bitmap.close === "function") v.bitmap.close(); } catch (e) {} }
+        if (v.deleted || !v.rect || v.rect.length < 4) return;
+        if (v.annotationType !== T.STAMP && v.annotationType !== T.SIGNATURE) return;
+        // 원래 있던 것은 자리나 크기를 바꾼 경우만 (댓글·설명만 고친 것은 박지 않는다)
+        if (v.id && isEditor && !(rawValue && (rawValue._hasBeenMoved || rawValue._hasBeenResized))) return;
+        out.push([v.rect[0], v.rect[1], v.rect[2], v.rect[3]]);
+      });
+    } catch (e) {}
+    return out;
+  }
+  // 이미 만들어진 PDF 바이트에 주석으로 들어가 있는 서명·그림을, 자리(rects)로 찾아 박아 넣는다.
+  // 쪽을 지우거나 순서를 바꾼 저장, 합친 문서의 저장은 PDF.js의 다른 길(ExtractPages)로 만들어져 평소의 박아 넣기를 거치지 않는다.
+  // 그 바이트를 임시 문서로 열어 저장 처리(패치됨)를 한 번 더 거친다. 실패하면 받은 바이트를 그대로 돌려준다.
+  function bakeBytes(data, rects) {
+    var task = null;
+    function finish(result) {
+      var p;
+      try { p = task ? Promise.resolve(task.destroy()) : Promise.resolve(); } catch (e) { p = Promise.resolve(); }
+      return p.then(function () { return result; }, function () { return result; });
+    }
+    return Promise.resolve().then(function () {
+      var opts = { data: data.slice(0) };      // 사본을 넘긴다 (넘긴 버퍼는 작업자 쪽으로 옮겨 가 못 쓰게 된다)
+      try {
+        var w = app.pdfLoadingTask && app.pdfLoadingTask._worker;
+        if (w && !w.destroyed) opts.worker = w;
+      } catch (e) {}
+      task = globalThis.pdfjsLib.getDocument(opts);
+      return task.promise;
+    }).then(function (tmp) {
+      tmp._transport.pkFlatten = { subtypes: ["Stamp"], all: true, rects: rects };
+      return tmp.saveDocument().then(function (out) {
+        return flattenResult(tmp._transport).then(function (res) {
+          return finish({ data: (res && res.done) ? out : data, info: res });
+        });
+      });
+    }).then(null, function (e) {
+      post("log|bakeBytes failed: " + (e && e.message ? e.message : e));
+      return finish({ data: data, info: { skipped: rects.length, content: rects.length, failedPages: 1 } });
+    });
+  }
+  // 저장이 끝난 뒤의 알림: 박아 넣은 수를 덧붙이고, 박지 못해 주석으로 남은 것이 있으면 호스트에도 알린다
+  function reportSaved(text, info) {
+    var n = info ? (info.done | 0) : 0;
+    var missed = info ? ((info.skipped | 0) + (info.blocked | 0)) : 0;
+    var failedPages = info ? (info.failedPages | 0) : 0;
+    toast(text + (n ? "  (서명·그림 " + n + "개를 문서에 박아 넣음)" : "") + (missed ? "  ※ " + missed + "개는 박지 못해 주석으로 남음" : ""), false);
+    if (missed || failedPages) post("flatnote|" + encodeInfo(info));
+  }
   function flattenReply(o) {
-    var s = "";
-    for (var k in o) s += k + "=" + String(o[k]).replace(/[;\r\n]/g, " ") + ";";
-    post("flattendone|" + s);
+    post("flattendone|" + encodeInfo(o));
   }
   function doFlatten(subtypes) {
     if (!app || !app.pdfDocument) { flattenReply({ error: "열린 문서가 없습니다" }); return; }
@@ -192,15 +267,15 @@
       .then(function (data) {
         workerSaved = false;
         return flattenResult().then(function (res) {
-          res = res || {};
-          var info = { done: res.done | 0, skipped: res.skipped | 0, blocked: res.blocked | 0, failed: res.failedPages | 0 };
+          var info = addInfo(res, null) || addInfo({}, null);
           if (!info.done) {
             // 박아 넣은 것이 없으면 파일을 건드리지 않는다
             keepDirty();
             flattenReply(info);
             return;
           }
-          return postSave(data, app._docFilename || "document.pdf", "").then(function (r) {
+          // 되돌릴 수 없는 일이므로, 저장 전의 파일을 백업하지 못하면 저장하지 않는다
+          return postSave(data, app._docFilename || "document.pdf", "?needbackup=1").then(function (r) {
             if (r && r.ok) {
               markSaved();
               flattenReply(info);
@@ -430,6 +505,8 @@
     else if (type === "text") runExport(extractText);
   });
 
+  if (isViewer) post("hello");   // 호스트가 설정(저장할 때 박아 넣기)을 바로 알려 준다
+
   if (!isViewer) {
     // 시작 화면: 다 그려지면 호스트에 준비됨 신호
     if (document.readyState === "complete") post("ready");
@@ -454,7 +531,8 @@
       var isExport = exportNext;
       var wasRotate = rotateSaveNext;
       var viaWorker = workerSaved;
-      var failed = saveFailed;
+      // PDF.js는 저장 처리가 실패하면 같은 save() 안에서 원본을 내려받는 쪽으로 넘어온다 (그동안 _saveInProgress 가 켜져 있다)
+      var failed = saveFailed && !!a._saveInProgress;
       saveAsNext = false;
       exportNext = false;
       rotateSaveNext = false;
@@ -468,21 +546,29 @@
       if (!data) { toast("저장할 데이터가 없습니다", true); return; }
       var name = filename || "document.pdf";
       if (isExport) name = "export:" + name.replace(/\.pdf$/i, "") + "_추출.pdf";
-      return postSave(data, name, useSaveAs || isExport ? "?saveas=1" : "")
-        .then(function (res) {
-          if (res.ok) {
-            if (!isExport) markSaved();
-            if (wasRotate) { toast("회전을 저장했습니다"); post("reload"); return; }
-            if (isExport || !viaWorker) { toast("저장됨: " + res.name); return; }
-            // 이번 저장에서 서명·그림을 박아 넣었으면 알려 준다
-            return flattenResult().then(function (fi) {
-              var n = fi ? (fi.done | 0) : 0;
-              toast("저장됨: " + res.name + (n ? "  (서명·그림 " + n + "개를 문서에 박아 넣음)" : ""));
-              if (fi && (fi.blocked | 0) > 0) post("flatblocked|" + (fi.blocked | 0));
-            });
-          } else if (!res.cancelled) {
-            toast("저장 실패: " + (res.error || ""), true);
-          }
+      var query = useSaveAs || isExport ? "?saveas=1" : "";
+      // 평소의 저장 처리를 거치지 않은 데이터(쪽 편집 저장, 합친 문서)에는 서명·그림이 주석으로 들어가 있다 → 자리로 찾아 박아 넣는다
+      var extraRects = [];
+      if (flattenAuto) {
+        extraRects = carriedRects.slice();
+        if (!viaWorker) extraRects = extraRects.concat(pendingStampRects());
+      }
+      var first = viaWorker ? flattenResult() : Promise.resolve(null);
+      return first
+        .then(function (fi) {
+          if (!extraRects.length || !(data instanceof Uint8Array)) return { data: data, info: fi };
+          return bakeBytes(data, extraRects).then(function (b) { return { data: b.data, info: addInfo(fi, b.info) }; });
+        })
+        .then(function (ready) {
+          return postSave(ready.data, name, query).then(function (res) {
+            if (res.ok) {
+              if (!isExport) markSaved();
+              reportSaved(wasRotate ? "회전을 저장했습니다" : "저장됨: " + res.name, ready.info);
+              if (wasRotate) post("reload");
+            } else if (!res.cancelled) {
+              toast("저장 실패: " + (res.error || ""), true);
+            }
+          });
         })
         .catch(function (err) { toast("저장 실패: " + err, true); });
     };
@@ -507,7 +593,11 @@
     ["documentloaded", "pagesinit", "pagesloaded", "annotationeditoruimanager"].forEach(function (ev) {
       a.eventBus.on(ev, function () { wrapStorage(); });
     });
+    // 합치기: 지금 저장소에 있는 서명·그림은 합친 문서에 주석으로 들어간다 → 자리를 기억해 두었다가 저장할 때 박아 넣는다
+    a.eventBus.on("saveandload", function () { carryNext = carriedRects.concat(pendingStampRects()); });
     a.eventBus.on("documentloaded", function () {
+      carriedRects = carryNext || [];
+      carryNext = null;
       setFlattenDefault();
       annDirty = false;
       savedStruct = "";

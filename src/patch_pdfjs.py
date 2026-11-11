@@ -169,58 +169,109 @@ function pkPlacementMatrix(rect, bbox, m) {
   const sy = (rect[3] - rect[1]) / (maxY - minY);
   return [sx, 0, 0, sy, rect[0] - minX * sx, rect[1] - minY * sy];
 }
-// 주석 하나를 쪽 내용으로 그릴 수 있으면 { apRef, matrix } 를, 아니면 null 을 돌려준다 (null 이면 주석으로 그대로 둔다)
-async function pkPlaceAppearance(dict, resolve, pageRotated) {
+function pkSameRect(a, b) {
+  return Math.abs(a[0] - b[0]) < 0.05 && Math.abs(a[1] - b[1]) < 0.05 && Math.abs(a[2] - b[2]) < 0.05 && Math.abs(a[3] - b[3]) < 0.05;
+}
+function pkRectsOverlap(a, b) {
+  return a[0] < b[2] - 0.1 && b[0] < a[2] - 0.1 && a[1] < b[3] - 0.1 && b[1] < a[3] - 0.1;
+}
+// 이번 저장에서 새로 만든 주석이거나, 원래 있던 주석의 자리·크기를 바꾼 것인가 (댓글이나 설명만 고친 기존 주석은 아니다)
+async function pkIsNewOrMoved(xref, ref, dict) {
+  if (!(ref instanceof Ref) || xref.getEntry(ref.num) === null) {
+    return true;
+  }
+  let original = null;
+  try {
+    original = await xref.fetchAsync(ref);
+  } catch {
+    return true;
+  }
+  if (!(original instanceof Dict)) {
+    return true;
+  }
+  const before = lookupNormalRect(original.getArray("Rect"), null);
+  const after = lookupNormalRect(dict.getArray("Rect"), null);
+  return !before || !after || !pkSameRect(before, after);
+}
+// 주석 하나를 쪽 내용으로 그릴 수 있으면 { apRef, matrix } 를, 아니면 { reason } 을 돌려준다 (그러면 주석으로 그대로 둔다).
+//   hidden: 원래 보이지 않는 주석(세지 않는다) / special: 쪽 내용으로는 같게 그릴 수 없는 표시 방식 /
+//   comment: 댓글이 달려 있음(박으면 댓글을 둘 곳이 없다) / noAppearance: 모양 정보가 없거나 온전치 않음
+async function pkPlaceAppearance(dict, subtypeName, resolve, pageRotated) {
   const flags = dict.get("F");
   const f = Number.isInteger(flags) ? flags : 0;
   if (f & 0x22) {
-    return null; // 숨김(2), 화면에 보이지 않음(32)
+    return {
+      reason: "hidden"
+    }; // 숨김(2), 화면에 보이지 않음(32)
   }
-  if (f & 0x08) {
-    return null; // 확대해도 크기가 변하지 않는 주석: 쪽 내용으로는 같게 그릴 수 없다
+  if (f & 0x08 || f & 0x10 && pageRotated || dict.has("OC")) {
+    return {
+      reason: "special"
+    }; // 확대해도 크기가 그대로인 주석, 돌려 놓은 쪽에서도 바로 서 있는 주석, 레이어에 따라 보였다 안 보였다 하는 주석
   }
-  if (f & 0x10 && pageRotated) {
-    return null; // 돌려 놓은 쪽에서도 바로 서 있는 주석
-  }
-  if (dict.has("OC")) {
-    return null; // 레이어에 따라 보였다 안 보였다 하는 주석
+  if (subtypeName !== "FreeText") {
+    const contents = dict.get("Contents");
+    if (typeof contents === "string" && stringToPDFString(contents).trim() !== "") {
+      return {
+        reason: "comment"
+      };
+    }
   }
   const ap = dict.get("AP");
   if (!(ap instanceof Dict)) {
-    return null; // 모양 정보가 없는 주석 (뷰어마다 알아서 그리는 것)
+    return {
+      reason: "noAppearance"
+    }; // 뷰어마다 알아서 그리는 주석 (pdf.js 가 저장한 한글 글상자 등)
   }
   let apRef = ap.getRaw("N");
   let stream = await resolve(apRef);
   if (stream instanceof Dict) {
     const state = dict.get("AS");
     if (!(state instanceof Name)) {
-      return null;
+      return {
+        reason: "noAppearance"
+      };
     }
     apRef = stream.getRaw(state.name);
     stream = await resolve(apRef);
   }
   if (!(apRef instanceof Ref) || !(stream instanceof BaseStream) || !(stream.dict instanceof Dict)) {
-    return null;
+    return {
+      reason: "noAppearance"
+    };
   }
   if (!isName(stream.dict.get("Subtype"), "Form")) {
-    return null;
+    return {
+      reason: "noAppearance"
+    };
+  }
+  if (stream.dict.has("Group")) {
+    return {
+      reason: "special"
+    }; // 투명 그룹으로 된 모양: 주석으로 그릴 때는 그룹을 무시하고 쪽 내용으로 그릴 때는 따르는 뷰어가 있어(pdf.js·poppler) 모습이 달라질 수 있다
   }
   const rect = lookupNormalRect(dict.getArray("Rect"), null);
   const bbox = lookupRect(stream.dict.getArray("BBox"), null);
   if (!rect || !bbox || !(rect[2] > rect[0]) || !(rect[3] > rect[1])) {
-    return null;
+    return {
+      reason: "noAppearance"
+    };
   }
   const matrix = pkPlacementMatrix(rect, bbox, lookupMatrix(stream.dict.getArray("Matrix"), IDENTITY_MATRIX));
   if (!matrix.every(Number.isFinite)) {
-    return null;
+    return {
+      reason: "noAppearance"
+    };
   }
   return {
     apRef,
     matrix
   };
 }
-// 쪽 내용 맨 앞에 q 하나를 붙였다고 치고 끝까지 읽어, 닫히지 않고 남는 q 의 수(우리 것 포함, 1 이상)를 센다.
-// 쪽 내용에 Q 가 더 많아 우리 q 가 중간에 닫히면 -1: 앞뒤를 감싸면 쪽의 모습이 달라질 수 있으므로 그 쪽은 건드리지 않는다.
+// 쪽 내용 맨 앞에 q 하나를 붙였다고 치고 끝까지 읽어, 우리 그림을 덧붙이기 전에 닫아야 할 q 의 수(우리 것 포함)를 센다.
+//   1 이상: 그만큼 Q 를 붙인다 / 0: 쪽 내용의 맨 마지막 Q 가 우리 q 를 닫았다(더 붙일 것 없음) /
+//   -1: 덧붙이면 안 되는 쪽 — 우리 q 가 닫힌 뒤에도 내용이 이어지거나(앞뒤를 감싸면 쪽의 모습이 달라진다),
+//       글자 묶음(BT)이나 표시 내용(BMC/BDC)이 닫히지 않은 채 끝난다(우리 그림이 그 안에 들어가 버린다)
 async function pkUnclosedSaves(page, xref) {
   const stream = await page.getContentStream();
   const stateManager = new StateManager(new EvalState());
@@ -230,13 +281,36 @@ async function pkUnclosedSaves(page, xref) {
     fn: 0,
     args: null
   };
+  let inText = false,
+    marked = 0,
+    closedEarly = false;
   for (let i = 0; i < 50000000; i++) {
     operation.args = null;
     if (!preprocessor.read(operation)) {
-      return stateManager.stateStack.length;
+      return inText || marked > 0 ? -1 : stateManager.stateStack.length;
+    }
+    if (closedEarly) {
+      return -1;
+    }
+    switch (operation.fn) {
+      case OPS.beginText:
+        inText = true;
+        break;
+      case OPS.endText:
+        inText = false;
+        break;
+      case OPS.beginMarkedContent:
+      case OPS.beginMarkedContentProps:
+        marked++;
+        break;
+      case OPS.endMarkedContent:
+        if (marked > 0) {
+          marked--;
+        }
+        break;
     }
     if (stateManager.stateStack.length === 0) {
-      return -1;
+      closedEarly = true;
     }
   }
   return -1;
@@ -249,19 +323,29 @@ async function pkFlattenAnnotations({
   acroForm,
   options
 }) {
-  // done: 박아 넣은 수, skipped: 박아 넣을 수 없어 주석으로 둔 수, blocked: 전자서명 때문에 그대로 둔 수, failedPages: 오류로 건드리지 않은 쪽 수
+  // done: 박아 넣은 수 / blocked: 전자서명 문서라 그대로 둔 수 / failedPages: 내용을 읽다 오류가 난 쪽 수
+  // skipped: 박아 넣으려 했으나 주석으로 둔 수. 이유별로도 센다 —
+  //   noAppearance(모양 정보 없음), special(쪽 내용으로는 같게 그릴 수 없음), comment(댓글이 달림),
+  //   overlap(남는 주석·양식 칸 위에 겹쳐 있음), content(쪽 내용이 온전치 않아 덧붙일 수 없음)
   const result = {
     done: 0,
     skipped: 0,
     blocked: 0,
     failedPages: 0,
-    pages: 0
+    pages: 0,
+    noAppearance: 0,
+    special: 0,
+    comment: 0,
+    overlap: 0,
+    content: 0
   };
   const wanted = new Set(Array.isArray(options?.subtypes) ? options.subtypes : []);
   if (wanted.size === 0) {
     return result;
   }
-  const all = !!options.all; // true: 문서에 이미 있던 주석까지, false: 이번 저장에서 새로 만들었거나 고친 주석만
+  const all = !!options.all; // true: 문서에 이미 있던 주석까지, false: 이번 저장에서 새로 만들었거나 자리·크기를 바꾼 주석만
+  // rects 가 있으면 사각형이 그 가운데 하나와 같은 주석만 (쪽 편집 저장처럼 다른 길로 먼저 저장된 서명을 찾아 박을 때)
+  const rects = Array.isArray(options.rects) ? options.rects.filter(r => isNumberArray(r, 4)).map(r => Util.normalizeRect(r)) : null;
   const signed = await pkHasDigitalSignature(xref, acroForm);
   const resolve = async obj => {
     if (!(obj instanceof Ref)) {
@@ -270,7 +354,12 @@ async function pkFlattenAnnotations({
     const entry = changes.get(obj);
     return entry ? entry.data : xref.fetchAsync(obj);
   };
+  const skip = (reason, count = 1) => {
+    result[reason] += count;
+    result.skipped += count;
+  };
   for (let pageIndex = 0; pageIndex < numPages; pageIndex++) {
+    let pending = 0; // 이 쪽에서 박으려는 수 (쪽을 읽다 오류가 나면 이만큼을 못 박은 것으로 센다)
     try {
       const page = await pdfManager.getPage(pageIndex);
       if (!(page.ref instanceof Ref)) {
@@ -289,63 +378,79 @@ async function pkFlattenAnnotations({
       const changedRotate = pageChanged ? changedDict.get("Rotate") : undefined;
       const rotate = typeof changedRotate === "number" ? changedRotate : page.rotate;
       const pageRotated = (rotate % 360 + 360) % 360 !== 0;
-      const keep = [];
-      const draws = [];
-      const drop = [];
-      const popups = new Set();
+      // 1) 쪽의 주석을 순서대로 살펴 박을 것을 고른다
+      const entries = [];
+      let candidates = 0;
       for (const item of annots) {
         const inChanges = item instanceof Ref && changes.has(item);
-        if (!all && !inChanges) {
-          keep.push(item);
-          continue;
-        }
         let dict = null;
         try {
           dict = await resolve(item);
         } catch {
           dict = null;
         }
-        if (!(dict instanceof Dict)) {
-          keep.push(item);
+        const entry = {
+          item,
+          inChanges,
+          dict: dict instanceof Dict ? dict : null,
+          subtype: "",
+          flags: 0,
+          rect: null,
+          placed: null,
+          reason: null
+        };
+        entries.push(entry);
+        if (!entry.dict) {
           continue;
         }
-        const subtype = dict.get("Subtype");
-        if (!(subtype instanceof Name) || !wanted.has(subtype.name)) {
-          keep.push(item);
+        const subtype = entry.dict.get("Subtype");
+        entry.subtype = subtype instanceof Name ? subtype.name : "";
+        const flags = entry.dict.get("F");
+        entry.flags = Number.isInteger(flags) ? flags : 0;
+        entry.rect = lookupNormalRect(entry.dict.getArray("Rect"), null);
+        if (!wanted.has(entry.subtype)) {
           continue;
         }
-        const placed = await pkPlaceAppearance(dict, resolve, pageRotated);
-        if (!placed) {
-          result.skipped++;
-          keep.push(item);
+        if (!all && !(inChanges && (await pkIsNewOrMoved(xref, item, entry.dict)))) {
           continue;
         }
-        draws.push(placed);
-        if (inChanges) {
-          drop.push(item);
+        if (rects && !(entry.rect && rects.some(r => pkSameRect(r, entry.rect)))) {
+          continue;
         }
-        const popup = dict.getRaw("Popup");
-        if (popup instanceof Ref) {
-          popups.add(popup.toString());
+        const placed = await pkPlaceAppearance(entry.dict, entry.subtype, resolve, pageRotated);
+        if (placed.reason) {
+          entry.reason = placed.reason;
+        } else {
+          entry.placed = placed;
+          candidates++;
         }
       }
-      if (draws.length === 0) {
-        continue;
+      // 2) 박지 않고 남는 "보이는" 주석(양식 칸 포함)보다 위에 겹쳐 있던 것은 박지 않는다.
+      //    박으면 쪽 내용이 되어 남은 주석 밑으로 깔리므로 가려질 수 있다 (배경이 칠해진 양식 칸 위의 서명 등).
+      const covering = [];
+      for (const entry of entries) {
+        if (entry.placed && covering.some(r => pkRectsOverlap(r, entry.rect))) {
+          entry.placed = null;
+          entry.reason = "overlap";
+          candidates--;
+        }
+        if (!entry.placed && entry.dict && entry.rect && entry.subtype !== "Popup" && !(entry.flags & 0x22) && (entry.dict.has("AP") || entry.subtype === "Widget")) {
+          covering.push(entry.rect);
+        }
       }
       if (signed) {
-        result.blocked += draws.length;
+        result.blocked += candidates;
         continue;
       }
-      const kept = [];
-      for (const item of keep) {
-        if (item instanceof Ref && popups.has(item.toString())) {
-          if (changes.has(item)) {
-            drop.push(item);
-          }
-          continue;
+      for (const entry of entries) {
+        if (entry.reason && entry.reason !== "hidden") {
+          skip(entry.reason);
         }
-        kept.push(item);
       }
+      if (candidates === 0) {
+        continue;
+      }
+      pending = candidates;
       const rawContents = basePageDict.getRaw("Contents");
       let items;
       if (rawContents instanceof Ref) {
@@ -359,12 +464,13 @@ async function pkFlattenAnnotations({
       let unclosed = 0;
       if (items.length > 0) {
         unclosed = await pkUnclosedSaves(page, xref);
-        if (unclosed < 1) {
-          result.skipped += draws.length;
+        if (unclosed < 0) {
+          skip("content", candidates);
+          pending = 0;
           continue;
         }
       }
-      // 쪽의 자원 사전을 복제해(물려받은 것 포함) 모양들을 XObject 로 등록한다. 원래 사전은 다른 쪽과 함께 쓰일 수 있어 건드리지 않는다.
+      // 3) 쪽의 자원 사전을 복제해(물려받은 것 포함) 모양들을 XObject 로 등록한다. 원래 사전은 다른 쪽과 함께 쓰일 수 있어 건드리지 않는다.
       const baseResources = page.resources;
       const resources = new Dict(xref);
       if (baseResources instanceof Dict) {
@@ -381,17 +487,39 @@ async function pkFlattenAnnotations({
       }
       resources.set("XObject", xobjects);
       const ops = [];
+      const drop = [];
+      const popups = new Set();
       let counter = 0;
-      for (const {
-        apRef,
-        matrix
-      } of draws) {
+      for (const entry of entries) {
+        if (!entry.placed) {
+          continue;
+        }
         let name;
         do {
           name = `PkF${++counter}`;
         } while (xobjects.has(name));
-        xobjects.set(name, apRef);
-        ops.push(`q ${matrix.map(numberToPDFString).join(" ")} cm /${name} Do Q`);
+        xobjects.set(name, entry.placed.apRef);
+        ops.push(`q ${entry.placed.matrix.map(numberToPDFString).join(" ")} cm /${name} Do Q`);
+        if (entry.inChanges) {
+          drop.push(entry.item); // 새로 만들어진 주석 객체는 파일에 쓰지 않는다
+        }
+        const popup = entry.dict.getRaw("Popup");
+        if (popup instanceof Ref) {
+          popups.add(popup.toString()); // (댓글이 있는 주석은 위에서 걸러졌으므로 여기 오는 것은 빈 팝업이다)
+        }
+      }
+      const kept = [];
+      for (const entry of entries) {
+        if (entry.placed) {
+          continue;
+        }
+        if (entry.item instanceof Ref && popups.has(entry.item.toString())) {
+          if (entry.inChanges) {
+            drop.push(entry.item);
+          }
+          continue;
+        }
+        kept.push(entry.item);
       }
       const pageDict = basePageDict.clone();
       pageDict.set("Resources", resources);
@@ -420,10 +548,14 @@ async function pkFlattenAnnotations({
       for (const ref of drop) {
         changes.delete(ref);
       }
-      result.done += draws.length;
+      result.done += candidates;
       result.pages++;
+      pending = 0;
     } catch (ex) {
       result.failedPages++;
+      if (pending > 0) {
+        skip("content", pending);
+      }
       warn(`pkFlattenAnnotations: page ${pageIndex + 1}: "${ex}".`);
     }
   }
@@ -454,9 +586,16 @@ V2_WORKER = [
         '      pkFlattenLast = null;\n'
         '      if (pkFlatten && !isPureXfa && annotationStorage instanceof Map) {\n'
         '        const pkWanted = new Set(Array.isArray(pkFlatten.subtypes) ? pkFlatten.subtypes : []);\n'
-        '        for (const value of annotationStorage.values()) {\n'
-        '          if (value && pkWanted.has(pkFlattenSubtypeOf(value))) {\n'
-        '            delete value.accessibilityData;\n'
+        '        let pkSigned = true;\n'
+        '        try {\n'
+        '          pkSigned = await pkHasDigitalSignature(await pdfManager.ensureDoc("xref"), await pdfManager.ensureCatalog("acroForm"));\n'
+        '        } catch {}\n'
+        '        if (!pkSigned) {\n'
+        '          for (const value of annotationStorage.values()) {\n'
+        '            /* 새로 만든 것이고 댓글이 없는 것만: 전자서명 문서의 주석, 댓글이 달린 주석, 원래 있던 주석은 주석으로 남으므로 설명을 지우지 않는다 */\n'
+        '            if (value && !value.id && pkWanted.has(pkFlattenSubtypeOf(value)) && !(value.popup && !value.popup.deleted && value.popup.contents)) {\n'
+        '              delete value.accessibilityData;\n'
+        '            }\n'
         '          }\n'
         '        }\n'
         '      }',
@@ -490,7 +629,7 @@ V2_WORKER = [
         '          });\n'
         '        } catch (ex) {\n'
         '          /* 박아 넣기에 실패해도 저장은 평소대로(주석으로) 한다 */\n'
-        '          pkFlattenLast = { done: 0, skipped: 0, blocked: 0, failedPages: numPages, pages: 0 };\n'
+        '          pkFlattenLast = { done: 0, skipped: 0, blocked: 0, failedPages: numPages, pages: 0, noAppearance: 0, special: 0, comment: 0, overlap: 0, content: 0 };\n'
         '          warn(`pkFlattenAnnotations: "${ex}".`);\n'
         '        }\n'
         '      }\n'

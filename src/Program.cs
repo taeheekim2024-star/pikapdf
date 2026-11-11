@@ -76,6 +76,9 @@ namespace PdfViewerApp
                     try { files.Add(Path.GetFullPath(args[i])); } catch { files.Add(args[i]); }
                 }
             }
+            // 자체 시험은 사용자의 데이터 폴더를 쓰지 않는다. 그렇지 않으면 시험의 저장들이 사용자의 백업(최근 40개)을 밀어내고,
+            // 최근 문서·설정·브라우저 저장소(저장해 둔 서명, 문서별 보기 위치)에도 시험 흔적이 섞인다.
+            if (selftestDir != null) MainForm.DataDir = Path.Combine(selftestDir, "data");
             string mutexName = MutexNameBase;
             if (selftestDir != null || testClient) { mutexName += ".selftest"; PipeName = PipeNameBase + ".selftest"; }
 
@@ -152,7 +155,8 @@ namespace PdfViewerApp
         public const string AppName = "PDF 뷰어";
         public const string AppVersion = "1.3";
         public static readonly string BaseDir = AppDomain.CurrentDomain.BaseDirectory;
-        public static readonly string DataDir = Path.Combine(
+        // 설정·최근 문서·백업·브라우저 프로필이 놓이는 폴더. 자체 시험 때는 결과 폴더 안으로 바꾼다 (Program.Main)
+        public static string DataDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PDF뷰어");
 
         readonly List<string> startFiles;
@@ -913,26 +917,30 @@ namespace PdfViewerApp
 
         void ShowFlattenOutcome(FlattenOutcome r)
         {
-            SelftestLog("FLATTEN outcome done=" + r.Done + " skipped=" + r.Skipped + " blocked=" + r.Blocked + " failed=" + r.Failed + " error=" + r.Error);
+            SelftestLog("FLATTEN outcome " + r.Summary());
             if (!string.IsNullOrEmpty(r.Error)) { Error("박아 넣지 못했습니다.\n\n" + r.Error); return; }
             var sb = new StringBuilder();
             if (r.Done > 0) sb.Append(r.Done + "개를 문서에 박아 넣고 저장했습니다.");
-            else if (r.Blocked > 0)
-                sb.Append("전자서명이 들어 있는 문서라서 박아 넣지 않았습니다.\n쪽 내용을 바꾸면 전자서명이 '서명 후 변경됨'으로 표시되기 때문입니다.");
+            else if (r.Blocked > 0) sb.Append("박아 넣지 않았습니다.");
             else if (r.Skipped == 0 && r.Failed == 0) sb.Append("박아 넣을 것이 없습니다.");
             else sb.Append("박아 넣은 것이 없습니다.");
-            if (r.Skipped > 0)
-                sb.Append("\n\n" + r.Skipped + "개는 박아 넣을 수 없어 주석으로 그대로 두었습니다.\n(모양 정보가 들어 있지 않은 주석입니다. 한글 글상자가 대표적입니다.)");
-            if (r.Failed > 0) sb.Append("\n\n" + r.Failed + "쪽은 내용을 읽지 못해 건드리지 않았습니다.");
+            string why = r.ReasonLines();
+            if (why.Length > 0) sb.Append("\n\n다음은 박아 넣지 않고 주석으로 그대로 두었습니다.\n" + why);
             Info(sb.ToString());
         }
 
-        // 저장하면서 자동으로 박아 넣으려 했으나 전자서명이 있는 문서라 주석으로 남긴 경우
-        public void OnFlattenBlocked(DocTab doc, string count)
+        // 평소 저장에서 새로 넣은 서명·그림 가운데 박아 넣지 못한 것이 있을 때 (문서마다 한 번만 창으로 알리고, 그 뒤로는 화면 아래 알림만)
+        public void OnFlattenNote(DocTab doc, string arg)
         {
-            SelftestLog("FLATTEN blocked by a digital signature: " + count);
-            Info("이 문서에는 전자서명이 들어 있어서, 새로 넣은 서명·그림을 박아 넣지 않고 주석으로 저장했습니다.\n\n" +
-                 "쪽 내용을 바꾸면 전자서명이 '서명 후 변경됨'으로 표시되기 때문입니다.");
+            FlattenOutcome r = FlattenOutcome.Parse(arg);
+            SelftestLog("FLATTEN note " + r.Summary());
+            string why = r.ReasonLines();
+            if (why.Length == 0) return;
+            string key = (doc.DocPath ?? "") + "|" + why;
+            if (doc.FlattenNoteShown == key) return;
+            doc.FlattenNoteShown = key;
+            Info("저장은 했지만, 새로 넣은 서명·그림 가운데 박아 넣지 못해 주석으로 남은 것이 있습니다.\n" + why +
+                 "\n\n주석으로 남은 것은 다른 프로그램에서 따로 집어 옮기거나 복사할 수 있습니다.");
         }
 
         async void ToolCompress()
@@ -1725,6 +1733,110 @@ namespace PdfViewerApp
                 RemoveTab(tab);
                 tab = null;
 
+                // (바) 댓글: 댓글이 달린 새 그림은 주석으로 남고(댓글 보존), 저장돼 있던 서명에 댓글만 달아도 그 서명이 박히지 않는다
+                Flatten.TestOverride = true;
+                tab = await FlattenTestTab(source, Path.Combine(dir, "comment.pdf"));
+                await tab.EvalTestAsync(@"
+(function () {
+  var st = window.PDFViewerApplication.pdfDocument.annotationStorage, T = globalThis.pdfjsLib.AnnotationEditorType;
+  var c = new OffscreenCanvas(60, 30), g = c.getContext('2d');
+  g.fillStyle = '#0000ff'; g.fillRect(0, 0, 60, 30);
+  st.setValue('pdfjs_internal_editor_9002', {
+    annotationType: T.STAMP, bitmapId: 'image_test_9002', bitmap: c.transferToImageBitmap(), pageIndex: 0,
+    rect: [300, 500, 420, 560], rotation: 0, isSvg: false, structTreeParentId: null,
+    popup: { contents: 'KEEP-THIS-COMMENT', deleted: false, rect: [430, 440, 590, 540] }
+  });
+  chrome.webview.postMessage('testresult|seeded with a comment');
+})();");
+                await FlattenSaveAndReload(tab);
+                string commented = await tab.EvalTestAsync(FlattenProbeJs);
+                bool commentKept = Encoding.GetEncoding(28591).GetString(File.ReadAllBytes(tab.DocPath)).Contains("KEEP-THIS-COMMENT");
+                SelftestLog("TOOL flatten comment (new) → " + commented + " comment in file=" + commentKept);
+                if (StampCount(commented) != 1 || !commentKept || ColorNear(ProbeField(commented, "img"), 0, 0, 255, 16) || !ColorNear(ProbeField(commented, "imgA"), 0, 0, 255, 16)) ok = false;
+                RemoveTab(tab);
+
+                Flatten.TestOverride = false;
+                tab = await FlattenTestTab(source, Path.Combine(dir, "comment_only.pdf"));
+                await tab.EvalTestAsync(FlattenSeedJs);
+                await FlattenSaveAndReload(tab);                      // 서명·그림이 주석으로 든 파일
+                Flatten.TestOverride = true;
+                tab.SendFlattenSetting();
+                await tab.EvalTestAsync(@"
+(async function () {
+  try {
+    var doc = window.PDFViewerApplication.pdfDocument, st = doc.annotationStorage, T = globalThis.pdfjsLib.AnnotationEditorType;
+    var anns = await (await doc.getPage(1)).getAnnotations(), target = null;
+    anns.forEach(function (a) { if (a.subtype === 'Stamp' && Math.abs(a.rect[0] - 100) < 1) target = a; });
+    st.setValue('pdfjs_internal_editor_9004', {
+      annotationType: T.STAMP, id: target.id, pageIndex: 0, rect: target.rect.slice(0), rotation: 0, isSvg: false, structTreeParentId: null,
+      popup: { contents: 'ONLY-A-COMMENT', deleted: false, rect: [210, 440, 370, 540] }
+    });
+    chrome.webview.postMessage('testresult|comment only on ' + target.id);
+  } catch (e) { chrome.webview.postMessage('testresult|error:' + e); }
+})();");
+                await FlattenSaveAndReload(tab);
+                string commentOnly = await tab.EvalTestAsync(FlattenProbeJs);
+                bool onlyKept = Encoding.GetEncoding(28591).GetString(File.ReadAllBytes(tab.DocPath)).Contains("ONLY-A-COMMENT");
+                SelftestLog("TOOL flatten comment (only, on a saved signature) → " + commentOnly + " comment in file=" + onlyKept);
+                if (StampCount(commentOnly) != 2 || !onlyKept || ColorNear(ProbeField(commentOnly, "sig"), 255, 0, 0, 8)) ok = false;
+                RemoveTab(tab);
+
+                // (사) 겹침: 주석으로 남아 있는 그림 위에 새 서명을 겹쳐 놓으면, 박을 경우 그 밑에 깔리므로 박지 않는다
+                Flatten.TestOverride = false;
+                tab = await FlattenTestTab(source, Path.Combine(dir, "overlap.pdf"));
+                await tab.EvalTestAsync(FlattenSeedJs);
+                await FlattenSaveAndReload(tab);
+                Flatten.TestOverride = true;
+                tab.SendFlattenSetting();
+                await tab.EvalTestAsync(@"
+(function () {
+  var st = window.PDFViewerApplication.pdfDocument.annotationStorage, T = globalThis.pdfjsLib.AnnotationEditorType;
+  var x = 340, y = 520, w = 60, h = 20, N = NaN;      // 저장돼 있는 파란 그림(300..420, 500..560) 한가운데
+  st.setValue('pdfjs_internal_editor_9005', {
+    annotationType: T.SIGNATURE, isSignature: true, areContours: true, color: [0, 128, 0], thickness: 0,
+    pageIndex: 0, rect: [x, y, x + w, y + h], rotation: 0, structTreeParentId: null,
+    lines: [[N, N, N, N, x, y, N, N, N, N, x + w, y, N, N, N, N, x + w, y + h, N, N, N, N, x, y + h]]
+  });
+  chrome.webview.postMessage('testresult|overlapping signature');
+})();");
+                await FlattenSaveAndReload(tab);
+                string overlapped = await tab.EvalTestAsync(FlattenProbeJs);
+                SelftestLog("TOOL flatten overlap → " + overlapped);
+                // 세 개 모두 주석으로 남고, 주석까지 그리면 그림 한가운데(360,530)는 위에 놓인 초록 서명이 보인다
+                if (StampCount(overlapped) != 3 || !ColorNear(ProbeField(overlapped, "imgA"), 0, 128, 0, 8) || ColorNear(ProbeField(overlapped, "img"), 0, 128, 0, 8)) ok = false;
+                RemoveTab(tab);
+
+                // (아) 쪽을 지운 채 저장(PDF.js의 다른 저장 경로): 그때도 새 서명·그림이 박혀야 한다
+                Flatten.TestOverride = true;
+                tab = await FlattenTestTab(source, Path.Combine(dir, "pages_edited.pdf"));
+                await tab.EvalTestAsync(FlattenSeedJs);
+                Task<string> pagesSaved = ExpectSaved(tab);
+                await tab.Core.ExecuteScriptAsync("window.PDFViewerApplication.onSavePages({ data: { pageInfos: [{ document: null, includePages: [0, 1], pageIndices: [0, 1] }], copyLevels: null } });");
+                await WithTimeout(pagesSaved, 30000);
+                await Task.Delay(300);
+                Task<bool> pagesReady = ExpectReady(tab);
+                tab.NavigateTo(tab.DocPath);
+                string pagesEdited = await FlattenProbeAfter(tab, pagesReady);
+                string pageCount = await tab.EvalTestAsync("chrome.webview.postMessage('testresult|' + window.PDFViewerApplication.pagesCount);");
+                SelftestLog("TOOL flatten with pages removed → pages=" + pageCount + " " + pagesEdited);
+                if (pageCount != "2" || !FlattenBaked(pagesEdited)) ok = false;
+                RemoveTab(tab);
+
+                // (자) 합치기처럼 문서를 다시 만들어 불러온 뒤 저장: 그 전에 넣어 둔 서명·그림이 저장할 때 박혀야 한다
+                Flatten.TestOverride = true;
+                tab = await FlattenTestTab(source, Path.Combine(dir, "merged.pdf"));
+                await tab.EvalTestAsync(FlattenSeedJs);
+                Task<bool> mergedReady = ExpectReady(tab);
+                await tab.Core.ExecuteScriptAsync("window.PDFViewerApplication.eventBus.dispatch('saveandload', { source: window, data: { pageInfos: [{ document: null, includePages: [0, 1, 2], pageIndices: [0, 1, 2] }], copyLevels: null } });");
+                await WithTimeout(mergedReady, 30000);
+                await Task.Delay(500);
+                await FlattenSaveAndReload(tab);
+                string merged = await tab.EvalTestAsync(FlattenProbeJs);
+                SelftestLog("TOOL flatten after a reload in memory (merge) → " + merged);
+                if (!FlattenBaked(merged)) ok = false;
+                RemoveTab(tab);
+                tab = null;
+
                 // (마) 수정한 내용을 PDF로 만들지 못하면 파일을 건드리지 않고 실패를 알린다
                 //      (예전에는 수정이 빠진 원본을 그대로 덮어쓰고 "저장됨"이라고 했다)
                 tab = await FlattenTestTab(source, Path.Combine(dir, "fail.pdf"));
@@ -1887,7 +1999,8 @@ namespace PdfViewerApp
                     Task<bool> reloaded = ExpectReady(tab);
                     FlattenOutcome r = await tab.FlattenAsync("all");
                     if (r.Done > 0) { await WithTimeout(reloaded, 30000); await Task.Delay(300); }
-                    SelftestLog("FLATTEN extra " + name + " → done=" + r.Done + " skipped=" + r.Skipped + " blocked=" + r.Blocked + " failed=" + r.Failed + " error=" + r.Error);
+                    SelftestLog("FLATTEN extra " + name + " → done=" + r.Done + " skipped=" + r.Skipped + " blocked=" + r.Blocked + " failed=" + r.Failed +
+                        " why=overlap:" + r.Overlap + ",comment:" + r.Comment + ",noAppearance:" + r.NoAppearance + ",special:" + r.Special + ",content:" + r.Content + " error=" + r.Error);
                     if (!string.IsNullOrEmpty(r.Error)) ok = false;
                 }
                 catch (Exception ex) { SelftestLog("FLATTEN extra " + name + " FAILED " + ex.Message); ok = false; }
@@ -2605,6 +2718,7 @@ namespace PdfViewerApp
         public TaskCompletionSource<bool> ReadyTcs;
         public TaskCompletionSource<string> TestResultTcs;
         public TaskCompletionSource<string> FlattenTcs;
+        public string FlattenNoteShown;   // "박아 넣지 못한 것이 있다"는 창을 이미 보여 준 문서·사유 (같은 것을 저장할 때마다 띄우지 않게)
         public TaskCompletionSource<string> SavedTcs;   // 자체 시험: 다음 저장이 끝나면 저장된 경로로 끝난다
         public TaskCompletionSource<string> SaveFailedTcs;   // 자체 시험: 뷰어가 저장 실패를 알려 오면 끝난다
 
@@ -2905,11 +3019,12 @@ namespace PdfViewerApp
                 string readErr;
                 byte[] data = ReadBody(e, out readErr);
                 bool saveAs = uri.Query.IndexOf("saveas=1", StringComparison.Ordinal) >= 0;
+                bool needBackup = uri.Query.IndexOf("needbackup=1", StringComparison.Ordinal) >= 0;
                 string suggested = Uri.UnescapeDataString(path.Substring("/save/".Length));
                 Form.BeginInvoke((Action)delegate
                 {
                     string resultJson;
-                    try { resultJson = HandleSave(data, readErr, saveAs, suggested); }
+                    try { resultJson = HandleSave(data, readErr, saveAs, suggested, needBackup); }
                     catch (Exception ex) { Program.Log("save error: " + ex); resultJson = Util.JsonResult(false, null, ex.Message, false); }
                     RespondJson(e, env, resultJson);
                     deferral.Complete();
@@ -3009,7 +3124,8 @@ namespace PdfViewerApp
             }
         }
 
-        string HandleSave(byte[] data, string readErr, bool saveAs, string suggestedName)
+        // needBackup: 덮어쓰기 전의 파일을 백업하지 못하면 저장하지 않는다 (되돌릴 수 없는 "박아 넣기" 도구가 쓴다)
+        string HandleSave(byte[] data, string readErr, bool saveAs, string suggestedName, bool needBackup)
         {
             if (data == null || data.Length == 0)
             {
@@ -3053,7 +3169,7 @@ namespace PdfViewerApp
 
             try
             {
-                Util.WriteWithBackup(target, data);
+                Util.WriteWithBackup(target, data, needBackup);
             }
             catch (Exception ex)
             {
@@ -3147,8 +3263,12 @@ namespace PdfViewerApp
                         if (t != null) { FlattenTcs = null; t.TrySetResult(arg); }
                         break;
                     }
-                case "flatblocked":
-                    Form.OnFlattenBlocked(this, arg);
+                case "flatnote":
+                    Form.OnFlattenNote(this, arg);
+                    break;
+                case "hello":
+                    // 뷰어 스크립트가 시작하면서 설정을 묻는다 (문서가 다 열리기를 기다리지 않게)
+                    SendFlattenSetting();
                     break;
                 case "savefailed":
                     // 뷰어가 수정 내용을 PDF로 만들지 못해 저장을 그만둔 경우: "저장하고 닫기"를 기다리던 것을 푼다
@@ -3453,10 +3573,11 @@ namespace PdfViewerApp
         }
     }
 
-    // 박아 넣기 결과: 뷰어가 "done=3;skipped=1;blocked=0;failed=0;error=...;" 꼴로 알려 준다
+    // 박아 넣기 결과: 뷰어가 "done=3;skipped=1;blocked=0;failedPages=0;overlap=1;...;error=...;" 꼴로 알려 준다
     class FlattenOutcome
     {
         public int Done, Skipped, Blocked, Failed;
+        public int NoAppearance, Special, Comment, Overlap, Content;   // 박지 않고 둔 이유별 수 (합이 Skipped)
         public string Error;
 
         public static FlattenOutcome Parse(string s)
@@ -3472,10 +3593,37 @@ namespace PdfViewerApp
                 if (k == "done") r.Done = n;
                 else if (k == "skipped") r.Skipped = n;
                 else if (k == "blocked") r.Blocked = n;
-                else if (k == "failed") r.Failed = n;
+                else if (k == "failedPages") r.Failed = n;
+                else if (k == "noAppearance") r.NoAppearance = n;
+                else if (k == "special") r.Special = n;
+                else if (k == "comment") r.Comment = n;
+                else if (k == "overlap") r.Overlap = n;
+                else if (k == "content") r.Content = n;
                 else if (k == "error") r.Error = v;
             }
             return r;
+        }
+
+        public string Summary()
+        {
+            return "done=" + Done + " skipped=" + Skipped + " blocked=" + Blocked + " failed=" + Failed +
+                   " (noAppearance=" + NoAppearance + " special=" + Special + " comment=" + Comment + " overlap=" + Overlap + " content=" + Content + ") error=" + Error;
+        }
+
+        // 박지 않고 주석으로 둔 것들을 이유별로 한 줄씩
+        public string ReasonLines()
+        {
+            var sb = new StringBuilder();
+            if (Blocked > 0) sb.Append("\n· " + Blocked + "개: 전자서명(또는 사용 권한 서명)이 들어 있는 문서입니다. 쪽 내용을 바꾸면 그 서명이 '서명 후 변경됨'으로 표시됩니다.");
+            if (Overlap > 0) sb.Append("\n· " + Overlap + "개: 다른 주석이나 양식 칸 위에 겹쳐 있습니다. 박아 넣으면 그 밑에 깔려 가려질 수 있습니다.");
+            if (Comment > 0) sb.Append("\n· " + Comment + "개: 댓글이 달려 있습니다. 박아 넣으면 댓글이 없어집니다.");
+            if (NoAppearance > 0) sb.Append("\n· " + NoAppearance + "개: 모양 정보가 들어 있지 않습니다 (한글 글상자가 대표적입니다).");
+            if (Special > 0) sb.Append("\n· " + Special + "개: 표시 방식이 특수해 쪽 내용으로는 똑같이 그릴 수 없습니다.");
+            if (Content > 0) sb.Append("\n· " + Content + "개: 그 쪽의 내용이 온전하지 않아 덧붙일 수 없습니다.");
+            int other = Skipped - (Overlap + Comment + NoAppearance + Special + Content);
+            if (other > 0) sb.Append("\n· " + other + "개: 그 밖의 이유");
+            if (Failed > 0 && Content == 0) sb.Append("\n· " + Failed + "쪽은 내용을 읽지 못했습니다.");
+            return sb.ToString();
         }
     }
 
@@ -4467,7 +4615,7 @@ namespace PdfViewerApp
         }
 
         // 임시 파일에 먼저 쓰고, 원본은 백업 폴더에 복사한 뒤 바꿔치기
-        public static void WriteWithBackup(string target, byte[] data)
+        public static void WriteWithBackup(string target, byte[] data, bool requireBackup = false)
         {
             string dir = Path.GetDirectoryName(target);
             if (string.IsNullOrEmpty(dir)) dir = Directory.GetCurrentDirectory();
@@ -4477,7 +4625,12 @@ namespace PdfViewerApp
             {
                 if (File.Exists(target))
                 {
-                    try { Backup(target); } catch (Exception bx) { Program.Log("backup failed: " + bx.Message); }
+                    try { Backup(target); }
+                    catch (Exception bx)
+                    {
+                        Program.Log("backup failed: " + bx.Message);
+                        if (requireBackup) throw new IOException("저장 전의 파일을 백업하지 못해 저장하지 않았습니다 (" + bx.Message + ")");
+                    }
                     try { File.Replace(tmp, target, null, true); }
                     catch
                     {
