@@ -297,6 +297,291 @@
       .then(function () { setFlattenDefault(); });
   }
 
+  // 서명 놓기: 서명을 고르거나 새로 만들면 화면 가운데에 바로 놓이는 대신, 마우스를 따라다니다가 누른 자리에 놓인다.
+  // PDF.js는 서명을 "지금 보이는 쪽의 한가운데"에 만든다. 여기서는 그 순간을 붙잡아 만들지 않고 기다렸다가,
+  // 마우스가 쪽 위에 오면 그 쪽에 임시 서명을 만들어 마우스에 붙이고(아직 문서에는 넣지 않는다), 쪽을 누르면 그 자리에 확정한다.
+  var lastPointer = null;    // 마지막 마우스 위치 (창 좌표)
+  var placing = null;        // { ui, value, ed, since }: 놓을 자리를 기다리는 서명. ed = 마우스에 붙은 임시 서명 (마우스가 쪽 위에 있을 때만 있다)
+  var sigCreating = false;   // 우리가 서명을 만드는 중 (PDF.js의 addSignature를 그대로 통과시킨다)
+  var sigDialogNext = false; // 곧 만들어질 서명 편집기는 "새 서명 추가" 창의 빈 편집기다
+  var swallowClick = false;  // 자리를 정한 그 누름이 다른 일(선택 풀림, 끌기 시작)을 일으키지 않게
+  var swallowAt = 0;
+  var PLACE_HINT = "서명을 놓을 자리를 누르세요  (Esc: 취소)";
+  function hintHide() {      // 안내 문구는 자리를 정했거나 그만두면 바로 거둔다 (다른 알림이 떠 있으면 건드리지 않는다)
+    try { var t = document.getElementById("hostToast"); if (t && t.textContent === PLACE_HINT) t.style.opacity = "0"; } catch (e) {}
+  }
+  function sigMode() { try { return globalThis.pdfjsLib.AnnotationEditorType.SIGNATURE; } catch (e) { return 101; } }
+  function isSignatureEditor(ed) { try { return !!ed && !!ed.constructor && ed.constructor._type === "signature"; } catch (e) { return false; } }
+  function sigAlive(ed) {
+    try { return !!(ed && ed.div && ed.parent && ed._uiManager.getEditor(ed.id) === ed); } catch (e) { return false; }
+  }
+  // 마우스 아래가 정말 쪽인가. 쪽의 사각형은 도구 줄 밑으로도 이어져 있으므로, 도구 줄·펼침 목록·창·스크롤 막대에 가려진 곳은 빼야 한다.
+  // 돌려주는 값: 쪽 위면 그 쪽의 편집 층, 쪽과 쪽 사이의 틈이면 false, 쪽 영역 밖이면 null
+  function pageLayerAt(ui, x, y) {
+    try {
+      var el = document.elementFromPoint(x, y);
+      if (!el || !el.closest || !el.closest("#viewer")) return null;
+      return ui.findParent(x, y) || false;
+    } catch (e) { return null; }
+  }
+  // 창 좌표 → 그 쪽 편집 층 안의 좌표 (돌려 놓은 쪽은 층도 돌아가 있다)
+  function layerOffset(layer, x, y) {
+    var r = layer.div.getBoundingClientRect();
+    switch (layer.viewport.rotation) {
+      case 90: return [y - r.top, r.right - x];
+      case 180: return [r.right - x, r.bottom - y];
+      case 270: return [r.bottom - y, x - r.left];
+      default: return [x - r.left, y - r.top];
+    }
+  }
+  // 임시 서명은 주석 저장소에 넣지 않는다: 저장·인쇄에 나가지 않고, 문서가 "수정됨"으로 바뀌지도 않는다
+  function quietly(ui, fn) {
+    var own = Object.prototype.hasOwnProperty.call(ui, "addToAnnotationStorage"), prev = ui.addToAnnotationStorage;
+    ui.addToAnnotationStorage = function () {};
+    try { return fn(); }
+    finally { if (own) ui.addToAnnotationStorage = prev; else delete ui.addToAnnotationStorage; }
+  }
+  // 아직 놓지 않은 서명은 흐리게 그린다 (놓으면 또렷해진다)
+  function ghostFaint(ed, on) {
+    try { ed.parent.drawLayer.updateProperties(ed._drawId, { root: { opacity: on ? 0.55 : null } }); } catch (e) {}
+  }
+  // 마우스가 있는 쪽에 임시 서명을 만든다 (PDF.js가 저장해 둔 서명을 넣을 때 쓰는 길 그대로, 자리만 마우스 위치로)
+  function ghostCreate(layer, x, y) {
+    var p = placing, ed = null, off = layerOffset(layer, x, y), focused = document.activeElement;
+    var box = document.getElementById("viewerContainer"), top = box ? box.scrollTop : 0, left = box ? box.scrollLeft : 0;
+    sigCreating = true;
+    layer.addUndoableEditor = function () {};     // 임시 서명은 실행 취소 목록에 올리지 않는다 (놓을 때 한 번 올린다)
+    try {
+      ed = quietly(p.ui, function () { return layer.createAndAddNewEditor({ offsetX: off[0], offsetY: off[1] }, true, p.value); });
+    } finally {
+      sigCreating = false;
+      delete layer.addUndoableEditor;
+      // PDF.js가 새 편집기에 초점을 주면서 화면을 굴릴 수 있다(서명이 보기 영역 끝에 걸쳐 있을 때) → 굴린 것을 되돌린다
+      try { if (box && (box.scrollTop !== top || box.scrollLeft !== left)) { box.scrollTop = top; box.scrollLeft = left; } } catch (e) {}
+    }
+    if (!ed || !ed.div || ed._drawId === null) {
+      try { if (ed) quietly(p.ui, function () { ed.remove(); }); } catch (e) {}
+      return null;
+    }
+    ed.serialize = function () {                  // 안전장치: 혹시 저장소에 들어가더라도 놓기 전에는 저장·인쇄에 나가지 않는다 (놓이면 스스로 걷힌다)
+      if (placing && placing.ed === ed) return null;
+      delete ed.serialize;
+      return ed.serialize.apply(ed, arguments);
+    };
+    try { p.ui.unselect(ed); } catch (e) {}
+    ed.div.style.pointerEvents = "none";          // 따라다니는 동안에는 마우스에도 글쇠에도 반응하지 않는다 (테두리나 도구 줄이 뜨지 않게)
+    try { ed.div.inert = true; } catch (e) {}
+    try { ed._onStartDragging(); } catch (e) {}   // 다른 그림보다 위에 그린다
+    ghostFaint(ed, true);
+    try {                                         // 만들면서 옮겨 간 글쇠 초점을 되돌린다 (쪽 번호 칸 등에 입력하던 중일 수 있다)
+      if (focused && focused !== document.activeElement && focused !== document.body && document.contains(focused)) focused.focus({ preventScroll: true });
+    } catch (e) {}
+    p.ed = ed;
+    return ed;
+  }
+  function ghostDrop() {
+    var p = placing, ed = p && p.ed;
+    if (!ed) return;
+    p.ed = null;
+    try { delete ed.serialize; } catch (e) {}
+    try { if (ed._uiManager.getEditor(ed.id) === ed) quietly(p.ui, function () { ed.remove(); }); } catch (e) {}
+  }
+  // 서명의 가운데를 마우스 자리에 맞춘다 (쪽 밖으로는 나가지 않는다: 놓일 자리 그대로 보인다)
+  function ghostMove(ed, x, y) {
+    for (var i = 0; i < 3; i++) {
+      var r = ed.div.getBoundingClientRect();
+      var dx = x - (r.left + r.width / 2), dy = y - (r.top + r.height / 2);
+      if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+      var t = ed.screenToPageTranslation(dx, dy), pd = ed.parentDimensions;
+      ed.x += t[0] / pd[0];
+      ed.y += t[1] / pd[1];
+      ed.fixAndSetPosition();
+      ed._onTranslating(ed.x, ed.y);
+    }
+  }
+  // 임시 서명을 이 쪽(layer)의 마우스 자리에 둔다. 없으면 만든다.
+  // 다른 쪽에 있던 것은 옮기지 않고 그 쪽에 맞게 새로 만든다: 쪽마다 크기·방향·좌표 원점이 다를 수 있고, PDF.js는 편집기를 만들 때의 쪽 값을 계속 쓴다.
+  function ghostAt(layer, x, y) {
+    var p = placing, ed = p.ed;
+    if (ed && (!sigAlive(ed) || ed.parent !== layer)) { ghostDrop(); ed = null; }
+    if (!ed) ed = ghostCreate(layer, x, y);
+    if (ed) ghostMove(ed, x, y);
+    return ed;
+  }
+  function placingCancel() {
+    if (!placing) return;
+    ghostDrop();
+    placing = null;
+    window.__hostPlacing = false;
+    hintHide();
+  }
+  function placingFail(err) {
+    placingCancel();
+    toast("서명을 넣지 못했습니다" + (err ? ": " + err : ""), true);
+  }
+  function placingTrack(x, y) {
+    var p = placing;
+    if (!p) return;
+    try {
+      if (p.ui.getMode() !== sigMode()) { placingCancel(); return; }
+      var layer = pageLayerAt(p.ui, x, y);
+      if (layer === null) { ghostDrop(); return; }    // 쪽 영역 밖(도구 줄, 창, 스크롤 막대): 임시 서명을 거둔다. 돌아오면 다시 생긴다
+      if (!layer) return;                             // 쪽과 쪽 사이의 틈: 그대로 둔다
+      if (!ghostAt(layer, x, y)) placingFail("");
+    } catch (e) { placingFail(e); }
+  }
+  // 쪽을 눌렀다: 임시 서명을 그 자리에 확정하고 문서에 넣는다
+  function placingCommit(layer, x, y) {
+    var p = placing, ed = ghostAt(layer, x, y);
+    if (!ed) return false;
+    placing = null;
+    window.__hostPlacing = false;
+    try { delete ed.serialize; } catch (e) {}
+    try { ed.div.inert = false; } catch (e) {}
+    ed.div.style.pointerEvents = "";
+    ghostFaint(ed, false);
+    try { ed._onStopDragging(); } catch (e) {}
+    try { ed._setParentAndPosition(layer, ed.x, ed.y); } catch (e) {}   // 쪽 안쪽으로 맞추고 그려진 서명을 그 자리에 확정한다
+    p.ui.addToAnnotationStorage(ed);                                    // 여기서 문서에 들어간다 (이때부터 "수정됨")
+    try { layer.addUndoableEditor(ed); } catch (e) {}                   // Ctrl+Z 한 번으로 이 서명이 빠진다
+    try { p.ui.setSelected(ed); } catch (e) {}
+    try { ed.div.focus({ preventScroll: true }); } catch (e) {}         // 화살표 글쇠로 조금씩 옮기거나 Delete 로 지울 수 있게
+    hintHide();
+    return true;
+  }
+  function placingStart(ui, value) {
+    placingCancel();               // 아직 놓지 않은 서명이 있으면 그것은 버리고 새로 고른 것으로
+    placing = { ui: ui, value: value, ed: null, since: Date.now() };
+    window.__hostPlacing = true;
+    toast(PLACE_HINT);
+    if (lastPointer) placingTrack(lastPointer.x, lastPointer.y);
+  }
+  window.addEventListener("pointermove", function (e) {
+    lastPointer = { x: e.clientX, y: e.clientY };
+    if (placing) placingTrack(e.clientX, e.clientY);
+  }, true);
+  document.addEventListener("scroll", function () {        // 굴려서 쪽이 움직여도 임시 서명은 마우스 아래에 있게
+    if (placing && placing.ed && lastPointer) placingTrack(lastPointer.x, lastPointer.y);
+  }, true);
+  window.addEventListener("mouseout", function (e) {       // 마우스가 창 밖(위쪽 메뉴 등)으로 나가면 임시 서명을 거둔다
+    if (placing && !e.relatedTarget) ghostDrop();
+  }, true);
+  window.addEventListener("blur", function () { swallowClick = false; if (placing) ghostDrop(); });
+  window.addEventListener("pointercancel", function () { swallowClick = false; }, true);
+  window.addEventListener("pointerdown", function (e) {
+    swallowClick = false;     // 새 누름이 시작됐다: 앞선 누름의 뒤처리는 끝난 것이다
+    var p = placing;
+    if (!p) return;
+    lastPointer = { x: e.clientX, y: e.clientY };
+    if (e.button !== 0) return;
+    if (Date.now() - p.since < 400) return;   // 서명을 고른 누름에 바로 이어진 누름(두 번 누르기)은 놓는 것으로 치지 않는다
+    var layer = null;
+    try { if (p.ui.getMode() === sigMode()) layer = pageLayerAt(p.ui, e.clientX, e.clientY); } catch (x) {}
+    if (!layer) return;       // 쪽이 아닌 곳(도구 줄, 창, 스크롤 막대, 쪽 사이)을 누른 것은 원래대로 처리되고, 자리 정하기는 이어진다
+    var ok = false, err = "";
+    try { ok = placingCommit(layer, e.clientX, e.clientY); } catch (x) { err = x; }
+    if (!ok) placingFail(err);
+    swallowClick = true;      // 이 누름이 방금 놓은 서명의 선택을 풀거나 끌기를 시작하지 않게
+    swallowAt = Date.now();
+    e.preventDefault(); e.stopImmediatePropagation();
+  }, true);
+  ["pointerup", "click"].forEach(function (type) {
+    window.addEventListener(type, function (e) {
+      if (!swallowClick) return;
+      if (Date.now() - swallowAt > 3000) { swallowClick = false; return; }   // 그 누름의 것이 아니다 (떼는 신호를 못 받은 경우)
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (type === "click") swallowClick = false;
+      else setTimeout(function () { swallowClick = false; }, 300);   // 누름 뒤에 click 이 오지 않는 경우에 대비
+    }, true);
+  });
+  // 서명 편집기를 처음 만날 때 한 번: 서명 창의 "추가"가 서명을 넣는 순간(addSignature)을 붙잡는다
+  function hookSignatureEditor(editor) {
+    if (!isSignatureEditor(editor)) return;
+    var proto = Object.getPrototypeOf(editor);
+    if (!proto || proto.__hostAddHooked || typeof proto.addSignature !== "function") return;
+    proto.__hostAddHooked = true;
+    // 서명 창이 열려 있는 동안의 빈 서명 편집기는 저장할 것이 없다 (PDF.js는 이때 저장하려 하면 오류를 낸다)
+    var origSerialize = proto.serialize;
+    proto.serialize = function () { return this._drawOutlines ? origSerialize.apply(this, arguments) : null; };
+    var orig = proto.addSignature;
+    proto.addSignature = function (data, heightInPage, description, uuid) {
+      if (sigCreating) return orig.apply(this, arguments);        // 우리가 임시 서명을 만드는 중
+      // 서명 창에서 "추가"를 누른 경우만 붙잡는다: 그때의 편집기는 창이 떠 있는 동안 숨겨져 있다(div.hidden).
+      // 그 밖의 경우(PDF.js가 직접 그리는 경우, 모르는 꼴의 자료)는 그대로 둔다.
+      if (!data || !data.newCurves || !this.div || !this.div.hidden) {
+        var r = orig.apply(this, arguments);
+        if (this.__hostNoUndo) {                                  // 창의 빈 편집기에 그대로 그려 넣은 경우: 빼 두었던 실행 취소 항목을 올린다
+          this.__hostNoUndo = false;
+          try { this.parent.addUndoableEditor(this); } catch (e) {}
+        }
+        return r;
+      }
+      // 가운데에 넣지 않고 놓을 자리를 기다린다 (저장해 둔 서명을 고를 때와 같은 꼴의 자료로 바꿔 둔다)
+      var self = this;
+      placingStart(this._uiManager, { signatureData: {
+        lines: { curves: data.newCurves.map(function (pts) { return { points: pts }; }), thickness: data.thickness, width: data.width, height: data.height },
+        mustSmooth: false, areContours: data.areContours, description: description, uuid: uuid, heightInPage: heightInPage } });
+      // 비어 있는 이 편집기는 창이 닫히면서 PDF.js가 치운다. 혹시 남으면 여기서 치운다
+      setTimeout(function () {
+        try { if (self._drawId === null && self._uiManager.getEditor(self.id) === self) self.remove(); } catch (e) {}
+      }, 500);
+    };
+  }
+  // "새 서명 추가": PDF.js는 빈 서명 편집기를 먼저 만들고 창을 띄운다. 이 빈 편집기는
+  //  - 실행 취소 목록에 올리지 않는다 (창이 닫히면 지워지는데, 목록에 남으면 "다시 실행"이 오류를 내고 실행 취소 기록이 멈춘다)
+  //  - 그려진 것이 없는 동안에는 "비었다"고 답하게 한다 (PDF.js는 빈 것도 주석 저장소에 넣어, 창을 열기만 해도 문서가 "수정됨"이 된다)
+  function newSignatureDialog(ui, origParams, args) {
+    var layer = ui.currentLayer;
+    if (!layer) return origParams.apply(ui, args);
+    sigDialogNext = true;
+    layer.addUndoableEditor = function () {};
+    try { return origParams.apply(ui, args); }
+    finally { sigDialogNext = false; delete layer.addUndoableEditor; }
+  }
+  function hookSignatures(ui) {
+    if (!ui || ui.__hostSigHooked) return;
+    ui.__hostSigHooked = true;
+    if (placing && placing.ui !== ui) placingCancel();    // 다른 문서로 바뀌었다
+    try {
+      // 놓인 서명 위의 도구 줄에서 "설명 편집" 단추를 만들지 않는다 (PDF.js는 단추가 없으면 그냥 건너뛴다)
+      var sm = ui.signatureManager;
+      if (sm) sm.renderEditButton = function () { return Promise.resolve(null); };
+    } catch (e) {}
+    try {
+      var origAdd = ui.addEditor;
+      ui.addEditor = function (editor) {
+        try {
+          hookSignatureEditor(editor);
+          if (sigDialogNext && isSignatureEditor(editor)) {
+            sigDialogNext = false;
+            editor.__hostNoUndo = true;
+            editor.isEmpty = function () { return !this._drawOutlines; };
+          }
+        } catch (e) {}
+        return origAdd.apply(this, arguments);
+      };
+    } catch (e) {}
+    try {
+      // 그릴 것이 없는 빈 서명 편집기는 되살리지 않는다 (PDF.js는 여기서 오류를 내고, 그러면 실행 취소 기록이 멈춘다)
+      var origRebuild = ui.rebuild;
+      ui.rebuild = function (editor) {
+        if (isSignatureEditor(editor) && !editor._drawOutlines) return;
+        return origRebuild.apply(this, arguments);
+      };
+    } catch (e) {}
+    try {
+      var origParams = ui.updateParams, CREATE = globalThis.pdfjsLib.AnnotationEditorParamsType.CREATE;
+      ui.updateParams = function (type, value) {
+        if (type === CREATE && this.getMode() === sigMode()) {
+          // 저장해 둔 서명을 골랐다: PDF.js가 가운데에 만들기 전에 붙잡아, 놓을 자리를 기다린다
+          if (value && value.signatureData && value.signatureData.lines) { placingStart(this, value); return; }
+          if (!value || !value.signatureData) return newSignatureDialog(this, origParams, arguments);
+        }
+        return origParams.apply(this, arguments);
+      };
+    } catch (e) {}
+  }
+
   // PDF.js가 띄우는 브라우저의 "변경 사항이 저장되지 않았습니다" 경고창 막기 (저장 여부는 탭을 닫을 때 프로그램이 직접 묻는다)
   window.addEventListener("beforeunload", function (e) { e.stopImmediatePropagation(); }, true);
 
@@ -306,6 +591,12 @@
   window.addEventListener("keydown", function (e) {
     var ctrl = e.ctrlKey || e.metaKey;
     var k = (e.key || "").toLowerCase();
+    if (placing) {
+      // Esc: 놓을 자리를 기다리던 서명을 그만둔다 (창이 떠 있으면 Esc 는 그 창의 것이다)
+      if (k === "escape" && !document.querySelector("dialog[open]")) { e.preventDefault(); e.stopImmediatePropagation(); placingCancel(); return; }
+      // 다른 글쇠: 글쇠 명령(모두 선택, 지우기, 실행 취소 등)이 임시 서명을 건드리지 않게 거둔다. 마우스를 움직이면 다시 생긴다
+      if (placing.ed && k !== "control" && k !== "shift" && k !== "alt" && k !== "meta") ghostDrop();
+    }
     if (ctrl && e.shiftKey && k === "s") { e.preventDefault(); e.stopImmediatePropagation(); saveAs(); return; }
     if (ctrl && !e.shiftKey && !e.altKey && k === "w") { e.preventDefault(); e.stopImmediatePropagation(); post("close"); return; }
     if (ctrl && (k === "tab" || k === "pagedown" || k === "pageup")) {
@@ -609,6 +900,16 @@
     a.eventBus.on("pagesedited", function () { setTimeout(recomputeDirty, 0); });
     a.eventBus.on("saveandload", function () { setTimeout(recomputeDirty, 0); });
     a.eventBus.on("documenterror", function (e) { post("error|" + (e && e.message)); });
+    // 서명: 넣는 창의 설명 칸을 숨기고(값은 PDF.js가 알아서 채운다), 편집기 관리자가 생길 때마다 위의 갈고리를 건다
+    try { var dc = document.getElementById("addSignatureDescriptionContainer"); if (dc) dc.style.display = "none"; } catch (e) {}
+    a.eventBus.on("annotationeditoruimanager", function (evt) { hookSignatures(evt && evt.uiManager); });
+    a.eventBus.on("pagesloaded", function () {
+      try { hookSignatures(a.pdfViewer._layerProperties.annotationEditorUIManager); } catch (e) {}
+    });
+    // 놓을 자리를 기다리는 서명: 다른 도구로 바꾸거나 문서·쪽 구성이 바뀌면 그만두고, 확대·회전 중에는 임시 서명만 거둔다(마우스를 움직이면 다시 생긴다)
+    a.eventBus.on("annotationeditormodechanged", function (evt) { if (placing && (!evt || evt.mode !== sigMode())) placingCancel(); });
+    ["scalechanging", "rotationchanging"].forEach(function (ev) { a.eventBus.on(ev, function () { if (placing) ghostDrop(); }); });
+    ["pagesedited", "pagesdestroy", "documentloaded"].forEach(function (ev) { a.eventBus.on(ev, function () { placingCancel(); }); });
     a.eventBus.on("pagesloaded", function () { post("ready"); });
   });
 })();

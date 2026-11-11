@@ -153,7 +153,7 @@ namespace PdfViewerApp
     class MainForm : Form
     {
         public const string AppName = "PDF 뷰어";
-        public const string AppVersion = "1.3";
+        public const string AppVersion = "1.3.1";
         public static readonly string BaseDir = AppDomain.CurrentDomain.BaseDirectory;
         // 설정·최근 문서·백업·브라우저 프로필이 놓이는 폴더. 자체 시험 때는 결과 폴더 안으로 바꾼다 (Program.Main)
         public static string DataDir = Path.Combine(
@@ -1875,39 +1875,336 @@ namespace PdfViewerApp
             return ok;
         }
 
-        // 뷰어의 서명 도구를 실제로 거친다: 서명 모드로 바꾸고 "서명 추가" 창에서 이름을 입력해 서명을 만든다.
-        // 사용자가 저장해 둔 서명 목록(브라우저 저장소)은 건드리지 않는다: "저장해 두기"를 끄고, 끝나면 목록을 원래대로 되돌린다.
-        const string SignatureAddJs = @"
-(async function () {
-  var KEY = 'pdfjs.signature', kept = null, out = '';
-  try { kept = localStorage.getItem(KEY); } catch (e) {}
-  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
-  async function until(fn, ms) { var t = Date.now(); while (Date.now() - t < ms) { if (fn()) return true; await wait(50); } return false; }
-  try {
+        // 뷰어의 서명 도구를 실제로 거친다: 서명 모드로 바꾸고 "서명 추가" 창에서 이름을 입력해 서명을 만든 뒤, 마우스로 자리를 정한다.
+        // (자체 시험은 자기만의 브라우저 프로필을 쓰므로 사용자가 저장해 둔 서명 목록은 건드리지 않는다.)
+        // 마우스는 실제 마우스가 하는 대로 흉내 낸다: 그 자리에 보이는 요소에 포인터 이벤트를 보낸다.
+        const string SigLibJs = @"
+    function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+    async function until(fn, ms) { var t = Date.now(); while (Date.now() - t < ms) { if (fn()) return true; await wait(50); } return false; }
     var app = window.PDFViewerApplication, st = app.pdfDocument.annotationStorage;
+    var box = document.getElementById('viewerContainer');
+    function ui() { return app.pdfViewer._layerProperties.annotationEditorUIManager; }
+    function pageDiv(n) { var all = document.querySelectorAll('#viewer .page'); for (var i = 0; i < all.length; i++) if (all[i].getAttribute('data-page-number') == n) return all[i]; return null; }
+    function layerDiv(n) { var pg = pageDiv(n); return pg ? pg.querySelector('.annotationEditorLayer') : null; }
+    // 화면에 보이는 n쪽 부분 안의 한 점 (fx, fy: 0~1)
+    function spot(n, fx, fy) {
+      var lay = layerDiv(n);
+      if (!lay) throw new Error('page ' + n + ' has no editor layer');
+      var c = box.getBoundingClientRect(), r = lay.getBoundingClientRect();
+      var x0 = Math.max(r.left, c.left) + 6, x1 = Math.min(r.right, c.left + box.clientWidth) - 6;
+      var y0 = Math.max(r.top, c.top) + 6, y1 = Math.min(r.bottom, c.top + box.clientHeight) - 6;
+      if (x1 <= x0 || y1 <= y0) throw new Error('page ' + n + ' is not on screen');
+      return [Math.round(x0 + (x1 - x0) * fx), Math.round(y0 + (y1 - y0) * fy)];
+    }
+    function fire(type, x, y, buttons) {
+      var el = document.elementFromPoint(x, y) || document.documentElement;
+      var init = { clientX: x, clientY: y, bubbles: true, cancelable: true, composed: true, view: window, button: 0, buttons: buttons || 0 };
+      if (type === 'click') { el.dispatchEvent(new MouseEvent(type, init)); return; }
+      init.pointerId = 1; init.isPrimary = true; init.pointerType = 'mouse';
+      el.dispatchEvent(new PointerEvent(type, init));
+    }
+    // 화면에 보이는 서명(편집 상자)들
+    function sigs() {
+      var all = document.querySelectorAll('.annotationEditorLayer .signatureEditor'), out = [];
+      for (var i = 0; i < all.length; i++) { var r = all[i].getBoundingClientRect(); if (r.width > 0 && r.height > 0) out.push(all[i]); }
+      return out;
+    }
+    function fresh(base) { return sigs().filter(function (d) { return base.indexOf(d) < 0; }); }
+    function mid(d) { var r = d.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2, r.width, r.height]; }
+    function near(d, x, y, tol) { var m = mid(d); return Math.abs(m[0] - x) < tol && Math.abs(m[1] - y) < tol; }
+    function pageOf(d) { var pg = d.closest('.page'); return pg ? pg.getAttribute('data-page-number') : '?'; }
+    function upright(d) { var m = mid(d); return m[2] > m[3] * 1.5; }
+    // 그려진 서명(SVG) 요소
+    function drawEl(d) {
+      var m = mid(d), all = document.querySelectorAll('#viewer .canvasWrapper svg.draw');
+      for (var i = 0; i < all.length; i++) {
+        var r = all[i].getBoundingClientRect();
+        if (r.width > 0 && Math.abs(r.left + r.width / 2 - m[0]) < 4 && Math.abs(r.top + r.height / 2 - m[1]) < 4) return all[i];
+      }
+      return null;
+    }
+    // 문서가 수정됨 상태로 바뀐 횟수 (이 문서를 연 뒤로)
+    if (!st.__testMods) {
+      st.__testMods = { n: 0 };
+      var os0 = st.onSetModified;
+      st.onSetModified = function () { st.__testMods.n++; if (typeof os0 === 'function') return os0.apply(this, arguments); };
+    }
+    function mods() { return st.__testMods.n; }
+    // 문서에 들어 있는(저장하면 나가는) 서명 수
+    function docSigs() { var m = st.serializable.map, n = 0; if (m) m.forEach(function (v) { if (v && v.isSignature) n++; }); return n; }
+    // 그려진 서명(쪽 위의 SVG)이 편집 상자와 같은 자리에 있는가
+    function drawnAt(d) {
+      var m = mid(d), all = document.querySelectorAll('#viewer .canvasWrapper svg.draw');
+      for (var i = 0; i < all.length; i++) {
+        var r = all[i].getBoundingClientRect();
+        if (r.width > 0 && Math.abs(r.left + r.width / 2 - m[0]) < 4 && Math.abs(r.top + r.height / 2 - m[1]) < 4) return true;
+      }
+      return false;
+    }
+";
+
+        static string SigJs(string body)
+        {
+            return "(async function () {\n  function post(s) { chrome.webview.postMessage('testresult|' + s); }\n  try {\n" + SigLibJs + body + "\n  } catch (e) { post('error:' + e); }\n})();";
+        }
+
+        // 서명 추가 창을 열어 이름을 입력해 둔 상태까지
+        static string SignatureOpenJs(bool save)
+        {
+            return SigJs(@"
     var T = globalThis.pdfjsLib.AnnotationEditorType;
     app.eventBus.dispatch('switchannotationeditormode', { source: app, mode: T.SIGNATURE });
     await wait(400);
+    window.__sigTestSize0 = st.size; window.__sigTestMods0 = mods();
     var dlg = document.getElementById('addSignatureDialog');
     if (!dlg.open) document.getElementById('editorSignatureAddSignature').click();
     if (!(await until(function () { return dlg.open; }, 6000))) throw new Error('the add-signature dialog did not open');
     await wait(200);
-    document.getElementById('addSignatureSaveCheckbox').checked = false;
+    document.getElementById('addSignatureSaveCheckbox').checked = " + (save ? "true" : "false") + @";
     var inp = document.getElementById('addSignatureTypeInput');
     inp.value = 'Taehee Kim';
     inp.dispatchEvent(new Event('input', { bubbles: true }));
     await wait(300);
+    post('open=' + dlg.open + ';desc=' + getComputedStyle(document.getElementById('addSignatureDescriptionContainer')).display +
+      ';entries=' + (st.size - window.__sigTestSize0) + ';mods=' + (mods() - window.__sigTestMods0));");
+        }
+
+        // "추가"를 누른다: 서명이 가운데에 놓이지 않고(문서에도, 화면에도 없다) 놓을 자리를 기다려야 한다
+        static string SignatureConfirmJs()
+        {
+            return SigJs(@"
+    var n0 = sigs().length, doc0 = docSigs(), size0 = window.__sigTestSize0, mods0 = window.__sigTestMods0, dlg = document.getElementById('addSignatureDialog');
     document.getElementById('addSignatureAddButton').click();
-    if (!(await until(function () { return !dlg.open && st.size > 0; }, 6000))) throw new Error('no signature was added');
+    if (!(await until(function () { return !dlg.open && !!window.__hostPlacing; }, 6000))) throw new Error('the new signature is not waiting for a place');
+    await wait(800);
+    post('added=' + (docSigs() - doc0) + ';placing=' + !!window.__hostPlacing + ';shown=' + (sigs().length - n0) +
+      ';left=' + (document.querySelectorAll('.annotationEditorLayer .signatureEditor').length - sigs().length) + ';entries=' + (st.size - size0) + ';mods=' + (mods() - mods0));");
+        }
+
+        // 마우스를 쪽 위로 옮긴다: 임시 서명이 마우스에 붙어 보이고(가운데가 마우스 자리), 아직 문서에는 없다. page 0 = 지금 쪽
+        static string SignatureHoverJs(int page, string fx, string fy)
+        {
+            return SigJs(@"
+    var base = sigs(), size0 = st.size, mods0 = mods(), top0 = box.scrollTop, p = spot(" + page + @" || app.page, " + fx + ", " + fy + @");
+    window.__sigTestSpot = p;
+    fire('pointermove', p[0] - 50, p[1] - 30);
+    fire('pointermove', p[0], p[1]);
+    await wait(200);
+    var g = fresh(base), d = g[0];
+    post('ghost=' + g.length + ';follow=' + (!!d && near(d, p[0], p[1], 2)) + ';drawn=' + (!!d && drawnAt(d)) + ';inDoc=' + (st.size - size0) + ';page=' + (d ? pageOf(d) : '') +
+      ';upright=' + (!!d && upright(d)) + ';selected=' + (!!d && d.classList.contains('selectedEditor')) + ';faint=' + (!!d && !!drawEl(d) && drawEl(d).getAttribute('opacity') !== null) +
+      ';mods=' + (mods() - mods0) + ';scrolled=' + Math.round(box.scrollTop - top0) + ';placing=' + !!window.__hostPlacing + ';at=' + p.join(','));");
+        }
+
+        // 도구 줄 위에서는 임시 서명이 사라지고 거기를 눌러도 놓이지 않는다. 쪽을 누르면 그 자리에 놓이고, 그 뒤에는 따라오지 않는다
+        static string SignaturePlaceJs(int page, string fx, string fy)
+        {
+            return SigJs(@"
+    var p = spot(" + page + @" || app.page, " + fx + ", " + fy + @");
+    fire('pointermove', p[0], p[1]);
+    await wait(150);
+    var all0 = sigs(), size0 = st.size, mods0 = mods();
+    var tb = document.getElementById('toolbarContainer').getBoundingClientRect();
+    var q = [p[0], Math.round(tb.top + tb.height / 2)];
+    var under = !!ui().findParent(q[0], q[1]);          // 쪽의 사각형은 도구 줄 밑으로도 이어져 있다
+    fire('pointermove', q[0], q[1]);
+    await wait(100);
+    var gone = sigs().length === all0.length - 1;
+    fire('pointerdown', q[0], q[1], 1); fire('pointerup', q[0], q[1]);
+    await wait(100);
+    var kept = !!window.__hostPlacing && st.size === size0 && sigs().length === all0.length - 1;
+    fire('pointermove', p[0], p[1]);
+    await wait(150);
+    var back = sigs().length === all0.length;
+    fire('pointerdown', p[0], p[1], 1); fire('pointerup', p[0], p[1]); fire('click', p[0], p[1]);
     await wait(400);
-    var rect = null, type = null, page = 0;
-    st.serializable.map.forEach(function (v) { if (v && v.isSignature) { rect = v.rect; type = v.annotationType; page = v.pageIndex + 1; } });
-    out = 'added=' + st.size + ';type=' + (type === T.SIGNATURE ? 'signature' : type) + ';page=' + page +
-      ';rect=' + (rect ? rect.map(function (v) { return Math.round(v * 100) / 100; }).join(',') : '');
-  } catch (e) { out = 'error:' + e; }
-  try { if (kept === null) localStorage.removeItem(KEY); else localStorage.setItem(KEY, kept); } catch (e) {}
-  chrome.webview.postMessage('testresult|' + out);
-})();";
+    var now = sigs(), d = null;
+    for (var i = 0; i < now.length; i++) if (near(now[i], p[0], p[1], 3)) d = now[i];
+    var solid = !!d && !!drawEl(d) && drawEl(d).getAttribute('opacity') === null, focused = !!d && document.activeElement === d, modsNow = mods() - mods0;
+    fire('pointermove', p[0] + 90, p[1] + 60);
+    await wait(150);
+    var stays = !!d && near(d, p[0], p[1], 3) && sigs().length === now.length;
+    var rect = null, page = 0;
+    st.serializable.map.forEach(function (v, key) { var e = st.getRawValue(key); if (v && v.isSignature && e && e.div === d) { rect = v.rect; page = v.pageIndex + 1; } });
+    post('under=' + under + ';gone=' + gone + ';kept=' + kept + ';back=' + back + ';placed=' + !!d + ';drawn=' + (!!d && drawnAt(d)) + ';stays=' + stays + ';grew=' + (st.size - size0) +
+      ';count=' + (now.length - all0.length) + ';selected=' + (!!d && d.classList.contains('selectedEditor')) + ';upright=' + (!!d && upright(d)) + ';placing=' + !!window.__hostPlacing +
+      ';solid=' + solid + ';focused=' + focused + ';mods=' + modsNow +
+      ';descButton=' + document.querySelectorAll('.editToolbar .editDescription').length +
+      ';hint=' + (document.getElementById('hostToast') ? getComputedStyle(document.getElementById('hostToast')).opacity === '0' || document.getElementById('hostToast').style.opacity === '0' ? 'off' : 'on' : 'off') + ';page=' + page +
+      ';rect=' + (rect ? rect.map(function (v) { return Math.round(v * 100) / 100; }).join(',') : ''));");
+        }
+
+        // 저장해 둔 서명을 목록에서 고른다 (실제로는 마우스가 그 단추 위에 있다): 가운데에 놓이지 않고 놓을 자리를 기다려야 한다
+        static string SignatureSavedJs()
+        {
+            return SigJs(@"
+    var size0 = st.size, n0 = sigs().length;
+    var b = document.querySelector('.toolbarAddSignatureButton');
+    if (!b) throw new Error('no saved signature in the list');
+    var r = b.getBoundingClientRect();
+    fire('pointermove', Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
+    b.click();
+    await wait(600);
+    post('saved=' + document.querySelectorAll('.toolbarAddSignatureButton').length + ';added=' + (st.size - size0) + ';placing=' + !!window.__hostPlacing + ';shown=' + (sigs().length - n0));");
+        }
+
+        // 자리를 정하는 중에 Esc 를 누르면 그 서명은 넣지 않는다
+        static string SignatureEscJs()
+        {
+            return SigJs(@"
+    var size0 = st.size, was = !!window.__hostPlacing, n0 = sigs().length, mods0 = mods(), p = window.__sigTestSpot;
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true, cancelable: true }));
+    await wait(200);
+    var keyDrop = n0 - sigs().length, sizeKey = st.size;
+    fire('pointermove', p[0] + 4, p[1] + 3);
+    await wait(200);
+    var back = sigs().length - (n0 - keyDrop);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await wait(300);
+    post('wasPlacing=' + was + ';keyDrop=' + keyDrop + ';back=' + back + ';before=' + size0 + ';afterKey=' + sizeKey + ';after=' + st.size + ';removed=' + (n0 - sigs().length) +
+      ';mods=' + (mods() - mods0) + ';placing=' + !!window.__hostPlacing);");
+        }
+
+        // 놓을 자리를 기다리는 중에 다른 도구로 바꾸면 그 서명은 넣지 않는다
+        static string SignatureModeJs()
+        {
+            return SigJs(@"
+    var doc0 = docSigs(), was = !!window.__hostPlacing, n0 = sigs().length;
+    var T = globalThis.pdfjsLib.AnnotationEditorType;
+    app.eventBus.dispatch('switchannotationeditormode', { source: app, mode: T.NONE });
+    await wait(500);
+    var out = 'wasPlacing=' + was + ';removed=' + (n0 - sigs().length) + ';added=' + (docSigs() - doc0) + ';placing=' + !!window.__hostPlacing + ';mode=' + ui().getMode();
+    app.eventBus.dispatch('switchannotationeditormode', { source: app, mode: T.SIGNATURE });
+    await wait(500);
+    post(out);");
+        }
+
+        // 놓은 서명은 실행 취소 한 번으로 빠지고, 다시 실행하면 돌아온다
+        static string SignatureUndoJs()
+        {
+            return SigJs(@"
+    var d0 = docSigs(), n0 = sigs().length;
+    ui().undo();
+    await wait(300);
+    var d1 = docSigs(), n1 = sigs().length;
+    ui().redo();
+    await wait(400);
+    post('undo=' + (d0 - d1) + '/' + (n0 - n1) + ';redo=' + (docSigs() - d1) + '/' + (sigs().length - n1));");
+        }
+
+        // 서명 모드로 바꾸고, 저장해 둔 서명 단추의 가운데(b)와 쪽 위의 한 점(p)을 창 좌표로 돌려준다
+        static string SignatureSpotsJs(int page, string fx, string fy)
+        {
+            return SigJs(@"
+    var T = globalThis.pdfjsLib.AnnotationEditorType;
+    app.page = " + page + @";
+    app.eventBus.dispatch('switchannotationeditormode', { source: app, mode: T.SIGNATURE });
+    await until(function () { var b = document.querySelector('.toolbarAddSignatureButton'); return b && b.getBoundingClientRect().width > 0 && layerDiv(" + page + @"); }, 6000);
+    await wait(600);
+    var r = document.querySelector('.toolbarAddSignatureButton').getBoundingClientRect(), p = spot(" + page + ", " + fx + ", " + fy + @");
+    post('bx=' + Math.round(r.left + r.width / 2) + ';by=' + Math.round(r.top + r.height / 2) + ';px=' + p[0] + ';py=' + p[1] + ';mode=' + ui().getMode());");
+        }
+
+        // 지금 상태: 놓을 자리를 기다리는 중인지, 보이는 서명 수, (x, y)에 서명이 있는지·선택되었는지, 문서에 든 서명 수
+        static string SignatureStateJs(int x, int y)
+        {
+            return SigJs(@"
+    var all = sigs(), d = null;
+    for (var i = 0; i < all.length; i++) if (near(all[i], " + x + ", " + y + @", 3)) d = all[i];
+    post('placing=' + !!window.__hostPlacing + ';shown=' + all.length + ';here=' + !!d + ';drawn=' + (!!d && drawnAt(d)) +
+      ';selected=' + (!!d && d.classList.contains('selectedEditor')) + ';doc=' + docSigs());");
+        }
+
+        // 브라우저에 실제 입력으로 들어가는 마우스·글쇠 (창 좌표, CSS 픽셀). 운영체제의 마우스는 움직이지 않는다
+        static async Task CdpMouse(DocTab tab, string type, int x, int y, bool leftDown)
+        {
+            bool press = type != "mouseMoved";
+            string json = "{\"type\":\"" + type + "\",\"x\":" + x + ",\"y\":" + y + ",\"button\":\"" + (press || leftDown ? "left" : "none") + "\",\"buttons\":" +
+                          (type == "mousePressed" || (type == "mouseMoved" && leftDown) ? "1" : "0") + ",\"clickCount\":" + (press ? "1" : "0") + ",\"pointerType\":\"mouse\"}";
+            await tab.Core.CallDevToolsProtocolMethodAsync("Input.dispatchMouseEvent", json);
+            await Task.Delay(60);
+        }
+
+        static async Task CdpClick(DocTab tab, int x, int y)
+        {
+            await CdpMouse(tab, "mouseMoved", x, y, false);
+            await CdpMouse(tab, "mousePressed", x, y, true);
+            await CdpMouse(tab, "mouseReleased", x, y, true);
+        }
+
+        static async Task CdpEscape(DocTab tab)
+        {
+            const string key = "\"key\":\"Escape\",\"code\":\"Escape\",\"windowsVirtualKeyCode\":27,\"nativeVirtualKeyCode\":27}";
+            await tab.Core.CallDevToolsProtocolMethodAsync("Input.dispatchKeyEvent", "{\"type\":\"rawKeyDown\"," + key);
+            await tab.Core.CallDevToolsProtocolMethodAsync("Input.dispatchKeyEvent", "{\"type\":\"keyUp\"," + key);
+            await Task.Delay(60);
+        }
+
+        // 서명 창으로 만든 서명을 놓은 뒤: 실행 취소 두 번, 다시 실행 두 번 (PDF.js는 창의 빈 편집기를 되살리려다 오류를 내고 실행 취소 기록이 멈췄다)
+        static string SignatureUndoTwiceJs()
+        {
+            return SigJs(@"
+    var d0 = docSigs(), n0 = sigs().length;
+    ui().undo(); await wait(250); ui().undo(); await wait(250);
+    var d1 = docSigs();
+    ui().redo(); await wait(350); ui().redo(); await wait(350);
+    post('undone=' + (d0 - d1) + ';redone=' + (docSigs() - d1) + ';shown=' + (sigs().length - n0));");
+        }
+
+        static string SignatureModsJs()
+        {
+            return SigJs(@"
+    post('mods=' + mods() + ';entries=' + st.size);");
+        }
+
+        // 임시 서명이 보기 영역 맨 위 가장자리에 걸쳐 만들어져도 화면이 굴러가지 않는다
+        static string SignatureEdgeJs()
+        {
+            return SigJs(@"
+    box.scrollTop = pageDiv(2).offsetTop + 220;
+    await wait(700);
+    var base = sigs(), top0 = box.scrollTop, c = box.getBoundingClientRect();
+    var x = spot(2, 0.15, 0.5)[0], y = Math.round(c.top + 5);
+    fire('pointermove', x, y + 60);
+    fire('pointermove', x, y);
+    await wait(300);
+    var g = fresh(base), r = g.length ? g[0].getBoundingClientRect() : null;
+    post('ghost=' + g.length + ';above=' + (r ? Math.round(c.top - r.top) : '') + ';scrolled=' + Math.round(box.scrollTop - top0) + ';placing=' + !!window.__hostPlacing);");
+        }
+
+        // 쪽에서 쪽으로: 다른 쪽으로 가면(3쪽 → 2쪽) 임시 서명이 그 쪽에 하나만 있고,
+        // 방향이 다른 쪽(2쪽 → 돌려 놓은 1쪽)으로 가도 그 쪽에 맞게 만들어져 화면에서 똑바로 보인다. 1쪽을 눌러 놓는다
+        static string SignatureCrossJs()
+        {
+            return SigJs(@"
+    async function boundary(n) {
+      box.scrollTop = Math.max(0, pageDiv(n).offsetTop - Math.round(box.clientHeight / 2));
+      await until(function () { return layerDiv(n) && layerDiv(n - 1); }, 5000);
+      await wait(600);
+    }
+    var base = sigs(), size0 = st.size;
+    await boundary(3);
+    var a3 = spot(3, 0.4, 0.5); fire('pointermove', a3[0], a3[1]); await wait(150);
+    var g3 = fresh(base), on3 = g3.length === 1 && pageOf(g3[0]) === '3';     // (3쪽의 임시 서명은 다른 쪽으로 가면 없어지므로 지금 확인해 둔다)
+    var a2 = spot(2, 0.4, 0.5); fire('pointermove', a2[0], a2[1]); await wait(150);
+    var g2 = fresh(base);
+    var moved = on3 && g2.length === 1 && pageOf(g2[0]) === '2' && near(g2[0], a2[0], a2[1], 2) && drawnAt(g2[0]);
+    await boundary(2);
+    var b2 = spot(2, 0.4, 0.5); fire('pointermove', b2[0], b2[1]); await wait(150);
+    var h2 = fresh(base);
+    var b1 = spot(1, 0.4, 0.5); fire('pointermove', b1[0], b1[1]); await wait(150);
+    var h1 = fresh(base);
+    var remade = h2.length === 1 && h1.length === 1 && h1[0] !== h2[0] && pageOf(h1[0]) === '1' && near(h1[0], b1[0], b1[1], 2) && drawnAt(h1[0]);
+    var up = h1.length === 1 && upright(h1[0]), mid0 = st.size - size0;
+    fire('pointerdown', b1[0], b1[1], 1); fire('pointerup', b1[0], b1[1]); fire('click', b1[0], b1[1]);
+    await wait(400);
+    var left = fresh(base), rot = [], rect = null;
+    st.serializable.map.forEach(function (v, key) { var e = st.getRawValue(key); if (v && v.isSignature && e && left.length && e.div === left[0]) rect = v.rect; });
+    for (var k = 0; k < 3; k++) { try { rot.push(ui().getLayer(k).viewport.rotation); } catch (e) { rot.push('?'); } }
+    post('rot=' + rot.join('/') + ';moved=' + moved + ';remade=' + remade + ';upright=' + up + ';inDoc=' + mid0 + ';count=' + left.length + ';grew=' + (st.size - size0) +
+      ';page=' + (left.length ? pageOf(left[0]) : '') + ';placing=' + !!window.__hostPlacing +
+      ';rect=' + (rect ? rect.map(function (v) { return Math.round(v * 100) / 100; }).join(',') : ''));");
+        }
 
         // 주어진 사각형(쪽 좌표) 안의 어두운 화소 수: 주석은 그리지 않고 쪽 내용만 그려서 센다
         static string SignatureInkJs(string page, string rect)
@@ -1941,13 +2238,31 @@ namespace PdfViewerApp
             try
             {
                 tab = await FlattenTestTab(source, Path.Combine(dir, "signature.pdf"));
-                string added = await tab.EvalTestAsync(SignatureAddJs);
-                string rect = ProbeField(added, "rect"), page = ProbeField(added, "page");
-                if (added.StartsWith("error", StringComparison.Ordinal) || rect.Length == 0)
-                {
-                    SelftestLog("TOOL signature tool FAILED " + added);
-                    return false;
-                }
+                // (1) 새 서명: 창에 설명 칸이 없고, "추가"를 눌러도 가운데에 놓이지 않는다 (문서에도 화면에도 아직 없다)
+                string opened = await tab.EvalTestAsync(SignatureOpenJs(false));
+                await tab.CaptureShotPublic("08_signature_dialog.png");
+                string added = opened.StartsWith("error", StringComparison.Ordinal) ? opened : await tab.EvalTestAsync(SignatureConfirmJs());
+                // 창을 여는 것도, "추가"를 누르는 것도 문서를 건드리지 않는다 (저장소에 든 것 없음, "수정됨" 아님)
+                bool uiOk = ProbeField(opened, "desc") == "none" && ProbeField(opened, "entries") == "0" && ProbeField(opened, "mods") == "0" &&
+                            ProbeField(added, "added") == "0" && ProbeField(added, "placing") == "true" && ProbeField(added, "shown") == "0" &&
+                            ProbeField(added, "left") == "0" && ProbeField(added, "entries") == "0" && ProbeField(added, "mods") == "0";
+                // (2) 마우스가 쪽 위에 오면 서명이 마우스에 붙어 보인다. 아직 문서에는 없다
+                string hover = await tab.EvalTestAsync(SignatureHoverJs(0, "0.30", "0.55"));
+                await tab.CaptureShotPublic("09_signature_following.png");
+                bool hoverOk = ProbeField(hover, "ghost") == "1" && ProbeField(hover, "follow") == "true" && ProbeField(hover, "drawn") == "true" &&
+                               ProbeField(hover, "inDoc") == "0" && ProbeField(hover, "selected") == "false" && ProbeField(hover, "placing") == "true" &&
+                               ProbeField(hover, "faint") == "true" && ProbeField(hover, "mods") == "0" && ProbeField(hover, "scrolled") == "0";
+                // (3) 도구 줄 위에서는 사라지고 거기를 눌러도 놓이지 않는다. 쪽을 누르면 그 자리에 놓인다. 놓인 서명의 도구 줄에 설명 단추가 없다
+                string place = await tab.EvalTestAsync(SignaturePlaceJs(0, "0.30", "0.55"));
+                await tab.CaptureShotPublic("10_signature_placed.png");
+                bool placeOk = ProbeField(place, "gone") == "true" && ProbeField(place, "kept") == "true" && ProbeField(place, "back") == "true" &&
+                               ProbeField(place, "placed") == "true" && ProbeField(place, "drawn") == "true" && ProbeField(place, "stays") == "true" &&
+                               ProbeField(place, "grew") == "1" && ProbeField(place, "count") == "0" && ProbeField(place, "selected") == "true" &&
+                               ProbeField(place, "placing") == "false" && ProbeField(place, "descButton") == "0" && ProbeField(place, "hint") == "off" &&
+                               ProbeField(place, "solid") == "true" && ProbeField(place, "focused") == "true" && ProbeField(place, "mods") == "1";
+                string rect = ProbeField(place, "rect"), page = ProbeField(place, "page");
+                SelftestLog("TOOL signature place → " + opened + " → " + added + " → " + hover + " → " + place + (uiOk && hoverOk && placeOk ? "" : "  FAILED"));
+                if (rect.Length == 0) return false;
                 string before = await tab.EvalTestAsync(SignatureInkJs(page, rect));
                 await FlattenSaveAndReload(tab);
                 string after = await tab.EvalTestAsync(SignatureInkJs(page, rect));
@@ -1955,8 +2270,149 @@ namespace PdfViewerApp
                 int.TryParse(ProbeField(before, "dark"), out dark0);
                 int.TryParse(ProbeField(after, "dark"), out dark1);
                 bool baked = dark1 > dark0 + 40 && ProbeField(after, "annots").IndexOf("Stamp", StringComparison.Ordinal) < 0;
-                SelftestLog("TOOL signature tool → " + added + " → before " + before + " → saved " + after + (baked ? "" : "  NOT BAKED"));
-                return baked;
+                SelftestLog("TOOL signature tool → rect=" + rect + " → before " + before + " → saved " + after + (baked ? "" : "  NOT BAKED"));
+                // (4) Esc: 자리를 정하는 중에 누르면 그 서명은 들어가지 않는다 (따라다니던 것도 사라진다)
+                string opened1 = await tab.EvalTestAsync(SignatureOpenJs(false));
+                string again = opened1.StartsWith("error", StringComparison.Ordinal) ? opened1 : await tab.EvalTestAsync(SignatureConfirmJs());
+                string hover1 = await tab.EvalTestAsync(SignatureHoverJs(0, "0.30", "0.55"));
+                string esc = await tab.EvalTestAsync(SignatureEscJs());
+                bool escOk = ProbeField(hover1, "ghost") == "1" && ProbeField(esc, "wasPlacing") == "true" && ProbeField(esc, "removed") == "1" &&
+                             ProbeField(esc, "keyDrop") == "1" && ProbeField(esc, "back") == "1" && ProbeField(esc, "afterKey") == "0" &&
+                             ProbeField(esc, "before") == "0" && ProbeField(esc, "after") == "0" && ProbeField(esc, "mods") == "0" && ProbeField(esc, "placing") == "false";
+                SelftestLog("TOOL signature cancel → " + hover1 + " → " + esc + (escOk ? "" : "  FAILED (" + again + ")"));
+                // (5) 90도 돌려 놓은 1쪽에서: "서명 저장"을 켜고 새 서명을 놓는다. 돌아간 쪽에서도 마우스를 따라오고 화면에서 똑바로 보여야 한다
+                await tab.EvalTestAsync("window.PDFViewerApplication.page = 1; setTimeout(function () { chrome.webview.postMessage('testresult|page=' + window.PDFViewerApplication.page); }, 800);");
+                string opened2 = await tab.EvalTestAsync(SignatureOpenJs(true));
+                string kept = opened2.StartsWith("error", StringComparison.Ordinal) ? opened2 : await tab.EvalTestAsync(SignatureConfirmJs());
+                string hover2 = await tab.EvalTestAsync(SignatureHoverJs(1, "0.30", "0.55"));
+                string place2 = await tab.EvalTestAsync(SignaturePlaceJs(1, "0.30", "0.55"));
+                await tab.CaptureShotPublic("11_signature_rotated_page.png");
+                bool rotOk = ProbeField(hover2, "ghost") == "1" && ProbeField(hover2, "follow") == "true" && ProbeField(hover2, "upright") == "true" &&
+                             ProbeField(place2, "placed") == "true" && ProbeField(place2, "drawn") == "true" && ProbeField(place2, "upright") == "true" &&
+                             ProbeField(place2, "page") == "1" && ProbeField(place2, "grew") == "1" && ProbeField(place2, "placing") == "false";
+                SelftestLog("TOOL signature on the rotated page → " + kept + " → " + hover2 + " → " + place2 + (rotOk ? "" : "  FAILED"));
+                // (5-1) 서명 창으로 만든 서명: 실행 취소 두 번, 다시 실행 두 번이 오류 없이 되고 서명이 돌아온다
+                string undo2 = await tab.EvalTestAsync(SignatureUndoTwiceJs());
+                // (5-2) 저장한 뒤(문서를 다시 열지 않은 상태): 서명 창을 열고 "추가"한 뒤 Esc 로 그만둬도 문서는 "수정됨"이 되지 않는다
+                Task<string> savedOnly = ExpectSaved(tab);
+                tab.RequestSave();
+                await WithTimeout(savedOnly, 30000);
+                await Task.Delay(500);
+                string m0 = await tab.EvalTestAsync(SignatureModsJs());
+                string opened3 = await tab.EvalTestAsync(SignatureOpenJs(false));
+                string again3 = opened3.StartsWith("error", StringComparison.Ordinal) ? opened3 : await tab.EvalTestAsync(SignatureConfirmJs());
+                string hover5 = await tab.EvalTestAsync(SignatureHoverJs(1, "0.60", "0.40"));
+                string esc3 = await tab.EvalTestAsync(SignatureEscJs());
+                string m1 = await tab.EvalTestAsync(SignatureModsJs());
+                // (5-3) 보기 영역 맨 위 가장자리에서 임시 서명이 생겨도 화면이 튀지 않는다
+                string picked0 = await tab.EvalTestAsync(SignatureSavedJs());
+                string edge = await tab.EvalTestAsync(SignatureEdgeJs());
+                string esc4 = await tab.EvalTestAsync(SignatureEscJs());
+                await tab.EvalTestAsync("window.PDFViewerApplication.page = 1; setTimeout(function () { chrome.webview.postMessage('testresult|page=' + window.PDFViewerApplication.page); }, 800);");
+                int above;
+                int.TryParse(ProbeField(edge, "above"), out above);
+                bool afterOk = ProbeField(undo2, "undone") == "1" && ProbeField(undo2, "redone") == "1" && ProbeField(undo2, "shown") == "0" &&
+                               ProbeField(m0, "mods").Length > 0 && ProbeField(m0, "mods") == ProbeField(m1, "mods") && ProbeField(m0, "entries") == ProbeField(m1, "entries") &&
+                               ProbeField(hover5, "ghost") == "1" && ProbeField(esc3, "removed") == "1" && ProbeField(esc3, "placing") == "false" &&
+                               ProbeField(edge, "ghost") == "1" && above > 5 && ProbeField(edge, "scrolled") == "0" && ProbeField(esc4, "placing") == "false";
+                SelftestLog("TOOL signature undo twice, saved-then-cancelled, edge of the view → " + undo2 + " → " + m0 + " → " + again3 + " → " + esc3 + " → " + m1 +
+                            " → " + picked0 + " → " + edge + (afterOk ? "" : "  FAILED"));
+                // (6) 저장해 둔 서명을 목록에서 고른다: 가운데에 놓이지 않고 기다린다. 쪽 위에서 보이고, Esc 로 그만둔다
+                string picked = await tab.EvalTestAsync(SignatureSavedJs());
+                string hover3 = await tab.EvalTestAsync(SignatureHoverJs(1, "0.55", "0.45"));
+                string esc2 = await tab.EvalTestAsync(SignatureEscJs());
+                bool savedOk = ProbeField(picked, "added") == "0" && ProbeField(picked, "placing") == "true" && ProbeField(picked, "shown") == "0" &&
+                               ProbeField(hover3, "ghost") == "1" && ProbeField(hover3, "follow") == "true" && ProbeField(hover3, "inDoc") == "0" &&
+                               ProbeField(esc2, "removed") == "1" && ProbeField(esc2, "before") == "1" && ProbeField(esc2, "after") == "1" && ProbeField(esc2, "placing") == "false";
+                SelftestLog("TOOL signature from the saved list → " + picked + " → " + hover3 + " → " + esc2 + (savedOk ? "" : "  FAILED"));
+                // (7) 쪽에서 쪽으로 옮겨 다니다가 놓기 (같은 꼴의 쪽 사이, 방향이 다른 쪽으로)
+                string picked2 = await tab.EvalTestAsync(SignatureSavedJs());
+                string cross = await tab.EvalTestAsync(SignatureCrossJs());
+                await tab.CaptureShotPublic("12_signature_across_pages.png");
+                string[] rots = ProbeField(cross, "rot").Split('/');
+                bool crossOk = rots.Length == 3 && rots[0] != rots[1] && rots[1] == rots[2] && ProbeField(cross, "moved") == "true" && ProbeField(cross, "remade") == "true" &&
+                               ProbeField(cross, "upright") == "true" && ProbeField(cross, "inDoc") == "0" && ProbeField(cross, "count") == "1" &&
+                               ProbeField(cross, "grew") == "1" && ProbeField(cross, "page") == "1" && ProbeField(cross, "placing") == "false";
+                SelftestLog("TOOL signature across pages → " + picked2 + " → " + cross + (crossOk ? "" : "  FAILED"));
+                // (8) 놓은 서명은 실행 취소 한 번으로 빠지고 다시 실행하면 돌아온다. 기다리는 중에 다른 도구로 바꾸면 그만둔다
+                string undo = await tab.EvalTestAsync(SignatureUndoJs());
+                await tab.EvalTestAsync("window.PDFViewerApplication.page = 1; setTimeout(function () { chrome.webview.postMessage('testresult|page=' + window.PDFViewerApplication.page); }, 800);");
+                string picked3 = await tab.EvalTestAsync(SignatureSavedJs());
+                string hover4 = await tab.EvalTestAsync(SignatureHoverJs(1, "0.30", "0.55"));
+                string mode = await tab.EvalTestAsync(SignatureModeJs());
+                bool undoOk = ProbeField(undo, "undo") == "1/1" && ProbeField(undo, "redo") == "1/1" && ProbeField(hover4, "ghost") == "1" &&
+                              ProbeField(mode, "wasPlacing") == "true" && ProbeField(mode, "removed") == "1" && ProbeField(mode, "added") == "0" && ProbeField(mode, "placing") == "false";
+                SelftestLog("TOOL signature undo and tool change → " + undo + " → " + picked3 + " → " + hover4 + " → " + mode + (undoOk ? "" : "  FAILED"));
+                // (9) 돌려 놓은 1쪽에 놓은 두 서명(하나는 실행 취소 뒤 다시 실행한 것)도 저장하면 쪽에 박힌다
+                string rectA = ProbeField(place2, "rect"), rectB = ProbeField(cross, "rect");
+                bool bakedTwo = false;
+                if (rectA.Length > 0 && rectB.Length > 0)
+                {
+                    string a0 = await tab.EvalTestAsync(SignatureInkJs("1", rectA)), b0 = await tab.EvalTestAsync(SignatureInkJs("1", rectB));
+                    await FlattenSaveAndReload(tab);
+                    string a1 = await tab.EvalTestAsync(SignatureInkJs("1", rectA)), b1 = await tab.EvalTestAsync(SignatureInkJs("1", rectB));
+                    int da0, da1, db0, db1;
+                    int.TryParse(ProbeField(a0, "dark"), out da0); int.TryParse(ProbeField(a1, "dark"), out da1);
+                    int.TryParse(ProbeField(b0, "dark"), out db0); int.TryParse(ProbeField(b1, "dark"), out db1);
+                    bakedTwo = da1 > da0 + 40 && db1 > db0 + 40 && ProbeField(a1, "annots").IndexOf("Stamp", StringComparison.Ordinal) < 0;
+                    SelftestLog("TOOL signature on the rotated page saved → " + rectA + " dark " + da0 + "→" + da1 + ", " + rectB + " dark " + db0 + "→" + db1 +
+                                ", annots=" + ProbeField(a1, "annots") + (bakedTwo ? "" : "  NOT BAKED"));
+                }
+                else SelftestLog("TOOL signature on the rotated page saved → FAILED (no rect: '" + rectA + "' '" + rectB + "')");
+                // (10) 브라우저에 실제 입력으로 들어가는 마우스·글쇠로 한 번 더: 목록의 서명을 눌러 고르고, 쪽으로 옮겨, 눌러 놓고, 끌어 옮기고, Esc 로 그만둔다
+                bool realOk = false;
+                string spots = await tab.EvalTestAsync(SignatureSpotsJs(2, "0.35", "0.60"));
+                int bx, by, px, py;
+                if (int.TryParse(ProbeField(spots, "bx"), out bx) && int.TryParse(ProbeField(spots, "by"), out by) &&
+                    int.TryParse(ProbeField(spots, "px"), out px) && int.TryParse(ProbeField(spots, "py"), out py))
+                {
+                    await CdpClick(tab, bx, by);                                   // 목록에서 서명을 고른다
+                    await CdpMouse(tab, "mousePressed", px, py, true);              // 곧바로 이어진 누름(두 번 누르기)은 놓는 것으로 치지 않는다
+                    await CdpMouse(tab, "mouseReleased", px, py, true);
+                    await CdpMouse(tab, "mouseMoved", bx, by, false);              // (마우스는 다시 목록 위에)
+                    await Task.Delay(500);
+                    string r1 = await tab.EvalTestAsync(SignatureStateJs(px, py));  // 기다리는 중, 아직 아무것도 안 보인다
+                    await CdpMouse(tab, "mouseMoved", px - 40, py - 25, false);
+                    await CdpMouse(tab, "mouseMoved", px, py, false);
+                    await Task.Delay(250);
+                    string r2 = await tab.EvalTestAsync(SignatureStateJs(px, py));  // 마우스 자리에 보인다, 문서에는 없다
+                    await CdpMouse(tab, "mousePressed", px, py, true);              // 누른다
+                    await CdpMouse(tab, "mouseReleased", px, py, true);
+                    await Task.Delay(400);
+                    string r3 = await tab.EvalTestAsync(SignatureStateJs(px, py));  // 그 자리에 놓였고 선택되어 있다
+                    await CdpMouse(tab, "mouseMoved", px + 70, py + 45, false);     // 놓은 뒤에는 따라오지 않는다
+                    await Task.Delay(200);
+                    string r4 = await tab.EvalTestAsync(SignatureStateJs(px, py));
+                    await CdpMouse(tab, "mouseMoved", px, py, false);               // 놓은 서명을 끌어서 옮긴다
+                    await CdpMouse(tab, "mousePressed", px, py, true);
+                    await CdpMouse(tab, "mouseMoved", px + 15, py + 10, true);
+                    await CdpMouse(tab, "mouseMoved", px + 40, py + 25, true);
+                    await CdpMouse(tab, "mouseMoved", px + 60, py + 40, true);
+                    await CdpMouse(tab, "mouseReleased", px + 60, py + 40, true);
+                    await Task.Delay(400);
+                    string r5 = await tab.EvalTestAsync(SignatureStateJs(px + 60, py + 40));
+                    await CdpClick(tab, bx, by);                                   // 다시 고르고 쪽 위로 옮긴 뒤 Esc
+                    await Task.Delay(400);
+                    await CdpMouse(tab, "mouseMoved", px - 30, py - 80, false);
+                    await CdpMouse(tab, "mouseMoved", px, py - 70, false);
+                    await Task.Delay(250);
+                    string r6 = await tab.EvalTestAsync(SignatureStateJs(px, py - 70));
+                    await CdpEscape(tab);
+                    await Task.Delay(300);
+                    string r7 = await tab.EvalTestAsync(SignatureStateJs(px, py - 70));
+                    realOk = ProbeField(r1, "placing") == "true" && ProbeField(r1, "shown") == "0" && ProbeField(r1, "doc") == "0" &&
+                             ProbeField(r2, "shown") == "1" && ProbeField(r2, "here") == "true" && ProbeField(r2, "drawn") == "true" && ProbeField(r2, "selected") == "false" && ProbeField(r2, "doc") == "0" &&
+                             ProbeField(r3, "placing") == "false" && ProbeField(r3, "here") == "true" && ProbeField(r3, "selected") == "true" && ProbeField(r3, "doc") == "1" &&
+                             ProbeField(r4, "here") == "true" && ProbeField(r4, "shown") == "1" &&
+                             ProbeField(r5, "here") == "true" && ProbeField(r5, "drawn") == "true" && ProbeField(r5, "doc") == "1" &&
+                             ProbeField(r6, "placing") == "true" && ProbeField(r6, "shown") == "2" && ProbeField(r6, "here") == "true" && ProbeField(r6, "doc") == "1" &&
+                             ProbeField(r7, "placing") == "false" && ProbeField(r7, "shown") == "1" && ProbeField(r7, "doc") == "1";
+                    await tab.CaptureShotPublic("13_signature_real_input.png");
+                    SelftestLog("TOOL signature with real input → " + spots + " → picked " + r1 + " → over the page " + r2 + " → pressed " + r3 + " → moved away " + r4 +
+                                " → dragged " + r5 + " → picked again " + r6 + " → Esc " + r7 + (realOk ? "" : "  FAILED"));
+                }
+                else SelftestLog("TOOL signature with real input → FAILED (" + spots + ")");
+                return baked && uiOk && hoverOk && placeOk && escOk && rotOk && afterOk && savedOk && crossOk && undoOk && bakedTwo && realOk;
             }
             catch (Exception ex)
             {
