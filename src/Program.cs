@@ -1068,19 +1068,30 @@ namespace PdfViewerApp
                 if (files.Count == 0) return;
 
                 bool merge;
-                using (var dlg = new ImagesToPdfDialog(files))
+                if (SelftestDir != null)
                 {
-                    if (dlg.ShowDialog(this) != DialogResult.OK) return;
-                    fit = dlg.Fit;
-                    merge = dlg.Merge;
+                    // 자체 시험: 창을 띄우지 않고 정해진 선택으로 (설정도 건드리지 않는다)
+                    fit = PageFit.Image;
+                    merge = true;
                 }
-                ImagePdf.FitSetting = fit;
-                if (files.Count > 1) ImagePdf.MergeSetting = merge;
+                else
+                {
+                    using (var dlg = new ImagesToPdfDialog(files))
+                    {
+                        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                        fit = dlg.Fit;
+                        merge = dlg.Merge;
+                    }
+                    ImagePdf.FitSetting = fit;
+                    if (files.Count > 1) ImagePdf.MergeSetting = merge;
+                }
 
                 if (merge || files.Count == 1)
                 {
                     string suffix = files.Count > 1 ? " 외 " + (files.Count - 1) + "장" : "";
-                    string outPath = AskSavePath(files[0], suffix, ".pdf", "PDF 파일 (*.pdf)|*.pdf", "PDF로 저장");
+                    string outPath = SelftestDir != null
+                        ? Path.Combine(Path.GetDirectoryName(files[0]), "flow " + ImagePdf.MergedName(files))
+                        : AskSavePath(files[0], suffix, ".pdf", "PDF 파일 (*.pdf)|*.pdf", "PDF로 저장");
                     if (outPath == null) return;
                     jobs.Add(new ImageJob(files, outPath));
                 }
@@ -1674,6 +1685,39 @@ namespace PdfViewerApp
                 await Task.Run((Action)delegate { dp.WaitForExit(40000); });
                 SelftestLog("TOOL img2pdf direct → exit=" + (dp.HasExited ? dp.ExitCode.ToString() : "running") + " pages=" + (File.Exists(direct) ? CountPdfPages(direct) : -1));
                 if (!dp.HasExited || dp.ExitCode != 0 || !File.Exists(direct) || CountPdfPages(direct) != 2) ok = false;
+
+                // 6-2) 뷰어 안의 흐름: 그림 파일을 "열면"(끌어다 놓기·두 번째 실행과 같은 길) PDF로 바뀌어 탭으로 열려야 한다
+                string flowDir = Path.Combine(dir, "flow");
+                Directory.CreateDirectory(flowDir);
+                string fa = Path.Combine(flowDir, "사진 1.png"), fb = Path.Combine(flowDir, "사진 2.jpg");
+                File.Copy(files[0], fa, true); File.Copy(files[2], fb, true);
+                string flowPdf = Path.Combine(flowDir, "flow 사진 1 외 1장.pdf");
+                int tabsBefore = docs.Count;
+                OpenPaths(new List<string> { fb, fa });
+                DocTab flowTab = null;
+                for (int i = 0; i < 150 && flowTab == null; i++)
+                {
+                    await Task.Delay(100);
+                    flowTab = docs.FirstOrDefault(d => string.Equals(d.DocPath, flowPdf, StringComparison.OrdinalIgnoreCase));
+                }
+                if (flowTab == null) { SelftestLog("TOOL img2pdf in-app flow FAILED: no tab for " + flowPdf + " exists=" + File.Exists(flowPdf)); ok = false; }
+                else
+                {
+                    // 문서가 다 열릴 때까지 기다린다 (쪽 정보를 물어서 답이 오면 열린 것)
+                    for (int i = 0; i < 100; i++)
+                    {
+                        bool loaded = false;
+                        try { await flowTab.GetPageInfoAsync(); loaded = true; } catch { }
+                        if (loaded) break;
+                        await Task.Delay(200);
+                    }
+                    await Task.Delay(700);
+                    string probe = await flowTab.EvalTestAsync(ImageProbeJs);
+                    SelftestLog("TOOL img2pdf in-app flow → tabs " + tabsBefore + "→" + docs.Count + " view " + probe);
+                    string[] got = probe.Split(';');
+                    if (got.Length != 2 || !ProbeMatches(got[0], expect[0], 40) || !ProbeMatches(got[1], expect[2], 40)) ok = false;
+                    RemoveTab(flowTab);
+                }
 
                 // 7) (선택) 결과폴더\extra-images 에 그림을 넣어 두면 전부 PDF 하나로 만들고, 뷰어가 그린 쪽들을 PNG로 내보낸다.
                 //    여러 형식의 그림을 원본과 픽셀 단위로 비교하는 바깥 도구(파이썬 등)를 위한 것.
